@@ -1628,11 +1628,33 @@ def convert_to_mermaid(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]])
     """Convert topology to Mermaid diagram format."""
     lines = ["graph TD"]
 
+    # Track defined node IDs
+    defined_nodes = set()
+
     # Add nodes
     for node in nodes:
         node_id = hashlib.md5(node["id"].encode()).hexdigest()[:8]
         label = f"{node['name']}<br/>{node['type']}"
         lines.append(f"    {node_id}[\"{label}\"]")
+        defined_nodes.add(node["id"])
+
+    # Add missing target nodes from edges (e.g., pods referenced by services)
+    for edge in edges:
+        target = edge["target"]
+        if target not in defined_nodes:
+            # Parse target ID format: cluster:namespace:type:name
+            parts = target.split(":")
+            if len(parts) >= 4:
+                resource_type = parts[2]
+                resource_name = ":".join(parts[3:])  # Handle names with colons
+            else:
+                resource_type = "resource"
+                resource_name = target.split(":")[-1] if ":" in target else target
+
+            target_id = hashlib.md5(target.encode()).hexdigest()[:8]
+            label = f"{resource_name}<br/>{resource_type}"
+            lines.append(f"    {target_id}[\"{label}\"]")
+            defined_nodes.add(target)
 
     # Add edges
     for edge in edges:
