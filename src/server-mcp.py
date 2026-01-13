@@ -344,6 +344,10 @@ class PrometheusEndpointCache:
 # Global cache instance for Prometheus endpoints
 _prometheus_endpoint_cache = PrometheusEndpointCache()
 
+# Namespace cache for avoiding repeated API calls
+_namespace_cache = {"namespaces": None, "timestamp": 0}
+_NAMESPACE_CACHE_TTL = 60  # seconds
+
 
 def _is_running_in_cluster() -> bool:
     """Check if we're running inside a Kubernetes cluster."""
@@ -561,16 +565,24 @@ async def list_namespaces() -> List[str]:
     Returns:
         List[str]: Alphabetically sorted namespace names. Empty list if access denied or cluster unreachable.
     """
+    global _namespace_cache
+
+    current_time = time.time()
+    if (_namespace_cache["namespaces"] is not None and
+            current_time - _namespace_cache["timestamp"] < _NAMESPACE_CACHE_TTL):
+        logger.debug("Returning cached namespace list")
+        return _namespace_cache["namespaces"]
+
     try:
         logger.info("Retrieving all namespaces from Kubernetes cluster")
         namespaces = k8s_core_api.list_namespace()
-        namespace_list = [ns.metadata.name for ns in namespaces.items if ns.metadata and ns.metadata.name]
+        ns_names = sorted([ns.metadata.name for ns in namespaces.items if ns.metadata and ns.metadata.name])
 
-        # Sort for consistent output
-        namespace_list.sort()
+        _namespace_cache["namespaces"] = ns_names
+        _namespace_cache["timestamp"] = current_time
 
-        logger.info(f"Successfully retrieved {len(namespace_list)} namespaces")
-        return namespace_list
+        logger.info(f"Successfully retrieved {len(ns_names)} namespaces")
+        return ns_names
 
     except ApiException as e:
         if e.status == 403:
@@ -2551,7 +2563,7 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
     """
     Find Tekton pipelines matching a pattern across all accessible namespaces.
 
-    Searches PipelineRuns/TaskRuns by name, labels, or annotations. Falls back to substring matching.
+    Searches PipelineRuns/TaskRuns by name, labels, or annotations using cluster-wide queries.
 
     Args:
         pipeline_id_pattern: Pattern to match (partial name, label value, or substring).
@@ -2560,6 +2572,8 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
         Dict[str, Any]: Keys: pipeline_runs, task_runs, pipelines_as_code, all_namespaces_checked,
                         diagnostic_info, substring_matches.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     results = {
         "pipeline_runs": [],
         "task_runs": [],
@@ -2568,136 +2582,132 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
     }
 
     try:
-        logger.info(f"Searching for pipeline pattern '{pipeline_id_pattern}' across all namespaces")
+        logger.info(f"Searching for pipeline pattern '{pipeline_id_pattern}' using cluster-wide queries")
+        pattern_lower = pipeline_id_pattern.lower()
 
-        # Get ALL namespaces in the cluster
-        all_ns = await list_namespaces()
-        results["all_namespaces_checked"] = all_ns
+        # Use ThreadPoolExecutor for parallel API calls
+        loop = asyncio.get_event_loop()
+        executor = ThreadPoolExecutor(max_workers=3)
 
-        logger.info(f"Searching {len(all_ns)} namespaces for pattern '{pipeline_id_pattern}'")
-
-        # Check each namespace for pipeline resources
-        for namespace in all_ns:
+        def fetch_pipelineruns():
             try:
-                # 1. Check PipelineRuns (standard Tekton resource)
-                try:
-                    pipeline_runs = k8s_custom_api.list_namespaced_custom_object(
-                        group="tekton.dev",
-                        version="v1",
-                        namespace=namespace,
-                        plural="pipelineruns"
-                    )
+                return k8s_custom_api.list_cluster_custom_object(
+                    group="tekton.dev",
+                    version="v1",
+                    plural="pipelineruns"
+                )
+            except ApiException as e:
+                return {"error": str(e), "items": []}
 
-                    # Look for matches using multiple patterns
-                    for pr in pipeline_runs.get("items", []):
-                        pr_name = pr.get("metadata", {}).get("name", "")
-                        labels = pr.get("metadata", {}).get("labels", {})
+        def fetch_taskruns():
+            try:
+                return k8s_custom_api.list_cluster_custom_object(
+                    group="tekton.dev",
+                    version="v1",
+                    plural="taskruns"
+                )
+            except ApiException as e:
+                return {"error": str(e), "items": []}
 
-                        # Match on name or labels
-                        if (pipeline_id_pattern.lower() in pr_name.lower() or
-                                any(pipeline_id_pattern.lower() in str(label).lower() for label in labels.values())):
+        def fetch_repositories():
+            try:
+                return k8s_custom_api.list_cluster_custom_object(
+                    group="pipelinesascode.tekton.dev",
+                    version="v1alpha1",
+                    plural="repositories"
+                )
+            except ApiException as e:
+                return {"error": str(e), "items": []}
 
-                            # Found a match
-                            status = pr.get("status", {})
-                            conditions = status.get("conditions", [{}])
-                            condition = conditions[0] if conditions else {}
+        # Execute all 3 API calls in parallel
+        pr_future = loop.run_in_executor(executor, fetch_pipelineruns)
+        tr_future = loop.run_in_executor(executor, fetch_taskruns)
+        repo_future = loop.run_in_executor(executor, fetch_repositories)
 
-                            results["pipeline_runs"].append({
-                                "namespace": namespace,
-                                "name": pr_name,
-                                "status": condition.get("reason", "Unknown"),
-                                "message": condition.get("message", ""),
-                                "started_at": status.get("startTime", "unknown"),
-                                "completion_time": status.get("completionTime", "unknown"),
-                                "labels": labels
-                            })
-                except ApiException as e:
-                    if e.status != 404:  # Only log if it's not just "not found"
-                        results["diagnostic_info"][f"pipelineruns_error_{namespace}"] = str(e)
+        pipeline_runs_resp, task_runs_resp, repositories_resp = await asyncio.gather(
+            pr_future, tr_future, repo_future
+        )
 
-                # 2. Check TaskRuns
-                try:
-                    task_runs = k8s_custom_api.list_namespaced_custom_object(
-                        group="tekton.dev",
-                        version="v1",
-                        namespace=namespace,
-                        plural="taskruns"
-                    )
+        # Track namespaces found
+        namespaces_seen = set()
 
-                    for tr in task_runs.get("items", []):
-                        tr_name = tr.get("metadata", {}).get("name", "")
-                        labels = tr.get("metadata", {}).get("labels", {})
-                        pipeline_run = labels.get("tekton.dev/pipelineRun", "")
+        # Process PipelineRuns
+        if "error" in pipeline_runs_resp:
+            results["diagnostic_info"]["pipelineruns_error"] = pipeline_runs_resp["error"]
+        for pr in pipeline_runs_resp.get("items", []):
+            namespace = pr.get("metadata", {}).get("namespace", "")
+            namespaces_seen.add(namespace)
+            pr_name = pr.get("metadata", {}).get("name", "")
+            labels = pr.get("metadata", {}).get("labels", {})
 
-                        # Check multiple patterns for matching
-                        if (pipeline_id_pattern.lower() in tr_name.lower() or
-                            pipeline_id_pattern.lower() in pipeline_run.lower() or
-                                any(pipeline_id_pattern.lower() in str(label).lower() for label in labels.values())):
+            if (pattern_lower in pr_name.lower() or
+                    any(pattern_lower in str(v).lower() for v in labels.values())):
+                status = pr.get("status", {})
+                conditions = status.get("conditions", [{}])
+                condition = conditions[0] if conditions else {}
 
-                            status = tr.get("status", {})
-                            conditions = status.get("conditions", [{}])
-                            condition = conditions[0] if conditions else {}
+                results["pipeline_runs"].append({
+                    "namespace": namespace,
+                    "name": pr_name,
+                    "status": condition.get("reason", "Unknown"),
+                    "message": condition.get("message", ""),
+                    "started_at": status.get("startTime", "unknown"),
+                    "completion_time": status.get("completionTime", "unknown"),
+                    "labels": labels
+                })
 
-                            results["task_runs"].append({
-                                "namespace": namespace,
-                                "name": tr_name,
-                                "pipeline_run": pipeline_run,
-                                "status": condition.get("reason", "Unknown"),
-                                "message": condition.get("message", ""),
-                                "pod_name": status.get("podName", "unknown"),
-                                "labels": labels
-                            })
-                except ApiException as e:
-                    if e.status != 404:
-                        results["diagnostic_info"][f"taskruns_error_{namespace}"] = str(e)
+        # Process TaskRuns
+        if "error" in task_runs_resp:
+            results["diagnostic_info"]["taskruns_error"] = task_runs_resp["error"]
+        for tr in task_runs_resp.get("items", []):
+            namespace = tr.get("metadata", {}).get("namespace", "")
+            namespaces_seen.add(namespace)
+            tr_name = tr.get("metadata", {}).get("name", "")
+            labels = tr.get("metadata", {}).get("labels", {})
+            pipeline_run = labels.get("tekton.dev/pipelineRun", "")
 
-                # 3. Check PipelinesAsCode repositories (which might contain pipeline references)
-                try:
-                    repositories = k8s_custom_api.list_namespaced_custom_object(
-                        group="pipelinesascode.tekton.dev",
-                        version="v1alpha1",
-                        namespace=namespace,
-                        plural="repositories"
-                    )
+            if (pattern_lower in tr_name.lower() or
+                pattern_lower in pipeline_run.lower() or
+                    any(pattern_lower in str(v).lower() for v in labels.values())):
+                status = tr.get("status", {})
+                conditions = status.get("conditions", [{}])
+                condition = conditions[0] if conditions else {}
 
-                    for repo in repositories.get("items", []):
-                        repo_name = repo.get("metadata", {}).get("name", "")
-                        spec = repo.get("spec", {})
-                        status = repo.get("status", {})
+                results["task_runs"].append({
+                    "namespace": namespace,
+                    "name": tr_name,
+                    "pipeline_run": pipeline_run,
+                    "status": condition.get("reason", "Unknown"),
+                    "message": condition.get("message", ""),
+                    "pod_name": status.get("podName", "unknown"),
+                    "labels": labels
+                })
 
-                        # Look for runs or references to our pipeline pattern
-                        if pipeline_id_pattern.lower() in repo_name.lower():
-                            results.setdefault("pipelines_as_code", []).append({
-                                "namespace": namespace,
-                                "name": repo_name,
-                                "url": spec.get("url", "unknown"),
-                                "runs": status.get("runs", [])
-                            })
-                except ApiException as e:
-                    if e.status != 404:
-                        results["diagnostic_info"][f"repositories_error_{namespace}"] = str(e)
+        # Process Repositories
+        if "error" in repositories_resp:
+            results["diagnostic_info"]["repositories_error"] = repositories_resp["error"]
+        for repo in repositories_resp.get("items", []):
+            namespace = repo.get("metadata", {}).get("namespace", "")
+            namespaces_seen.add(namespace)
+            repo_name = repo.get("metadata", {}).get("name", "")
 
-            except Exception as e:
-                # Record any unexpected errors
-                results["diagnostic_info"][f"unexpected_error_{namespace}"] = str(e)
+            if pattern_lower in repo_name.lower():
+                spec = repo.get("spec", {})
+                status = repo.get("status", {})
+                results.setdefault("pipelines_as_code", []).append({
+                    "namespace": namespace,
+                    "name": repo_name,
+                    "url": spec.get("url", "unknown"),
+                    "runs": status.get("runs", [])
+                })
 
-        # 4. Check for substring matches if no exact matches found
-        if not results["pipeline_runs"] and not results["task_runs"]:
-            # Split the pattern into parts and try each part
-            pattern_parts = pipeline_id_pattern.split("-")
-            for part in pattern_parts:
-                if len(part) >= 4:  # Only try parts that are meaningful
-                    part_results = await find_pipeline(part)
-                    if part_results.get("pipeline_runs") or part_results.get("task_runs"):
-                        results["diagnostic_info"]["substring_match"] = f"Found matches using substring '{part}'"
-                        results["substring_matches"] = part_results
-                        break
+        results["all_namespaces_checked"] = sorted(namespaces_seen)
 
         # Add summary
         results["summary"] = {
             "pipeline_runs_found": len(results["pipeline_runs"]),
             "task_runs_found": len(results["task_runs"]),
-            "namespaces_searched": len(all_ns)
+            "namespaces_with_tekton_resources": len(namespaces_seen)
         }
 
         logger.info(f"Pipeline search complete: {results['summary']}")
