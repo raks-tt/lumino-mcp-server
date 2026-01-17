@@ -7,8 +7,11 @@
 # coordination, and artifact tracking.
 # ============================================================================
 
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
+
+logger = logging.getLogger("lumino-mcp")
 
 
 # ============================================================================
@@ -889,7 +892,8 @@ async def identify_affected_components(
 
                 elif scenario_type == "resource_limits":
                     # Identify pods/containers that could be affected by resource limit changes
-                    pods = await list_pods(namespace)
+                    # list_pods requires (namespace, k8s_core_api, logger)
+                    pods = await list_pods(namespace, k8s_core_api, logger)
                     for pod in pods[:10]:  # Limit pods to prevent timeout
                         if not pod.get("error"):
                             component_info = {
