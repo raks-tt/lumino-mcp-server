@@ -7709,6 +7709,99 @@ async def ci_cd_performance_baselining_tool(
                 if namespace in namespace_stats and not np.isnan(avg_duration):
                     namespace_stats[namespace]["avg_duration"] = avg_duration
 
+        # Query for P16 and P84 percentiles to calculate actual standard deviation
+        # std ≈ (P84 - P16) / 2 for normal distributions
+        p16_query = "histogram_quantile(0.16, sum by (namespace, le) (rate(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_bucket[1h])))"
+        p84_query = "histogram_quantile(0.84, sum by (namespace, le) (rate(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_bucket[1h])))"
+
+        p16_result = await _execute_prometheus_query_internal(p16_query)
+        p84_result = await _execute_prometheus_query_internal(p84_query)
+
+        # Store percentile data for std deviation calculation
+        percentile_data = {}
+        if p16_result.get("success"):
+            for item in p16_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                p16_val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+                if namespace not in percentile_data:
+                    percentile_data[namespace] = {"p16": 0, "p84": 0}
+                if not np.isnan(p16_val) and not np.isinf(p16_val):
+                    percentile_data[namespace]["p16"] = p16_val
+
+        if p84_result.get("success"):
+            for item in p84_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                p84_val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+                if namespace not in percentile_data:
+                    percentile_data[namespace] = {"p16": 0, "p84": 0}
+                if not np.isnan(p84_val) and not np.isinf(p84_val):
+                    percentile_data[namespace]["p84"] = p84_val
+
+        # Query for trend detection using range queries
+        # Compare recent performance (last 24h) vs historical baseline period
+        # This provides actual time-series trend analysis instead of heuristics
+        recent_avg_query = "sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[24h])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[24h]))"
+        historical_avg_query = f"sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[{baseline_period}])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}]))"
+
+        recent_success_query = "sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count{status='success'}[24h])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[24h])) * 100"
+        historical_success_query = f"sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count{{status='success'}}[{baseline_period}])) / sum by (namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}])) * 100"
+
+        logger.info(f"Querying trend data: recent (24h) vs historical ({baseline_period})")
+
+        recent_avg_result = await _execute_prometheus_query_internal(recent_avg_query)
+        historical_avg_result = await _execute_prometheus_query_internal(historical_avg_query)
+        recent_success_result = await _execute_prometheus_query_internal(recent_success_query)
+        historical_success_result = await _execute_prometheus_query_internal(historical_success_query)
+
+        # Store trend data for each namespace
+        trend_data = {}
+
+        # Process recent average duration
+        if recent_avg_result.get("success"):
+            for item in recent_avg_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+                if namespace not in trend_data:
+                    trend_data[namespace] = {"recent_avg": 0, "historical_avg": 0, "recent_success": 0, "historical_success": 0}
+                if not np.isnan(val) and not np.isinf(val):
+                    trend_data[namespace]["recent_avg"] = val
+
+        # Process historical average duration
+        if historical_avg_result.get("success"):
+            for item in historical_avg_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+                if namespace not in trend_data:
+                    trend_data[namespace] = {"recent_avg": 0, "historical_avg": 0, "recent_success": 0, "historical_success": 0}
+                if not np.isnan(val) and not np.isinf(val):
+                    trend_data[namespace]["historical_avg"] = val
+
+        # Process recent success rate
+        if recent_success_result.get("success"):
+            for item in recent_success_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+                if namespace not in trend_data:
+                    trend_data[namespace] = {"recent_avg": 0, "historical_avg": 0, "recent_success": 0, "historical_success": 0}
+                if not np.isnan(val) and not np.isinf(val):
+                    trend_data[namespace]["recent_success"] = val
+
+        # Process historical success rate
+        if historical_success_result.get("success"):
+            for item in historical_success_result.get("data", []):
+                metric = item.get("metric", {})
+                namespace = metric.get("namespace", "unknown")
+                val = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+                if namespace not in trend_data:
+                    trend_data[namespace] = {"recent_avg": 0, "historical_avg": 0, "recent_success": 0, "historical_success": 0}
+                if not np.isnan(val) and not np.isinf(val):
+                    trend_data[namespace]["historical_success"] = val
+
         # Query for reconciliation rates (success/failure rates per namespace)
         reconcile_query = "sum by (namespace_name, success) (rate(tekton_pipelines_controller_reconcile_count[1h]))"
         reconcile_result = await _execute_prometheus_query_internal(reconcile_query)
@@ -7751,9 +7844,15 @@ async def ci_cd_performance_baselining_tool(
             # Calculate success rate
             success_rate = (success_count / total_count * 100) if total_count > 0 else 0
 
-            # Estimate std deviation (using coefficient of variation heuristic from histogram data)
-            # For histogram data, we approximate std as ~0.4 * mean for typical pipeline distributions
-            estimated_std = avg_duration * 0.4
+            # Calculate std deviation from histogram percentiles (P84 - P16) / 2
+            # This provides actual statistical std deviation instead of an estimate
+            pdata = percentile_data.get(namespace, {"p16": 0, "p84": 0})
+            if pdata["p84"] > pdata["p16"] and pdata["p84"] > 0:
+                # Calculate actual std deviation from percentile spread
+                estimated_std = (pdata["p84"] - pdata["p16"]) / 2.0
+            else:
+                # Fallback: use coefficient of variation heuristic if percentile data unavailable
+                estimated_std = avg_duration * 0.4
 
             # Get reconciliation health
             recon = reconcile_stats.get(namespace, {"success_rate": 0, "failure_rate": 0})
@@ -7762,6 +7861,14 @@ async def ci_cd_performance_baselining_tool(
                 reconcile_health = "degraded"
             elif recon["failure_rate"] > 0.5:
                 reconcile_health = "warning"
+
+            # Calculate success rate confidence interval using binomial standard error
+            # SE = sqrt(p * (1-p) / n) where p is success rate as decimal
+            p = success_rate / 100.0
+            if total_count > 0 and 0 < p < 1:
+                success_rate_se = np.sqrt(p * (1 - p) / total_count) * 100  # Convert to percentage
+            else:
+                success_rate_se = 0  # No variance for 0% or 100% success rate
 
             # Create baseline entry
             baseline_metrics = {
@@ -7773,7 +7880,9 @@ async def ci_cd_performance_baselining_tool(
                 },
                 "success_rate": {
                     "mean_percent": success_rate,
-                    "lower_bound": max(0, success_rate - 10)
+                    "std_percent": success_rate_se,
+                    "lower_bound": max(0, success_rate - (deviation_threshold * success_rate_se)),
+                    "upper_bound": min(100, success_rate + (deviation_threshold * success_rate_se))
                 },
                 "reconciliation": {
                     "success_rate_per_second": recon["success_rate"],
@@ -7782,13 +7891,38 @@ async def ci_cd_performance_baselining_tool(
                 }
             }
 
-            # Determine trend based on reconciliation health
-            if reconcile_health == "healthy" and success_rate > 90:
-                trend = "Stable performance (no significant trend)"
-            elif reconcile_health == "degraded" or success_rate < 70:
-                trend = "Moderate performance degradation trend"
+            # Determine trend using actual time-series comparison (recent vs historical)
+            ns_trend = trend_data.get(namespace, {"recent_avg": 0, "historical_avg": 0, "recent_success": 0, "historical_success": 0})
+            recent_avg = ns_trend["recent_avg"]
+            historical_avg = ns_trend["historical_avg"]
+            recent_success = ns_trend["recent_success"]
+            historical_success = ns_trend["historical_success"]
+
+            # Calculate duration change percentage (positive = slower = degradation)
+            if historical_avg > 0 and recent_avg > 0:
+                duration_change_pct = ((recent_avg - historical_avg) / historical_avg) * 100
             else:
-                trend = "Slight performance variation (no clear trend)"
+                duration_change_pct = 0
+
+            # Calculate success rate change (positive = improvement)
+            success_change = recent_success - historical_success if (recent_success > 0 or historical_success > 0) else 0
+
+            # Determine trend based on actual metrics comparison
+            # Use deviation_threshold to determine significance (default 2.0 = ~5% significance)
+            significance_threshold = 10.0 / deviation_threshold  # ~5% change with default threshold
+
+            if abs(duration_change_pct) < significance_threshold and abs(success_change) < significance_threshold:
+                trend = "Stable performance (no significant trend)"
+                trend_direction = "stable"
+            elif duration_change_pct < -significance_threshold or success_change > significance_threshold:
+                trend = f"Performance improving: duration {duration_change_pct:+.1f}%, success rate {success_change:+.1f}%"
+                trend_direction = "improving"
+            elif duration_change_pct > significance_threshold or success_change < -significance_threshold:
+                trend = f"Performance degrading: duration {duration_change_pct:+.1f}%, success rate {success_change:+.1f}%"
+                trend_direction = "degrading"
+            else:
+                trend = f"Slight variation: duration {duration_change_pct:+.1f}%, success rate {success_change:+.1f}%"
+                trend_direction = "variable"
 
             pipeline_baseline = {
                 "pipeline_name": namespace,  # Using namespace as pipeline identifier for Prometheus data
@@ -7799,27 +7933,40 @@ async def ci_cd_performance_baselining_tool(
                 "success_count": int(success_count),
                 "failed_count": int(failed_count),
                 "last_updated": datetime.now().isoformat(),
-                "trend": trend
+                "trend": trend,
+                "trend_metrics": {
+                    "recent_avg_duration": recent_avg,
+                    "historical_avg_duration": historical_avg,
+                    "duration_change_pct": duration_change_pct,
+                    "recent_success_rate": recent_success,
+                    "historical_success_rate": historical_success,
+                    "success_rate_change": success_change,
+                    "comparison_period": f"24h vs {baseline_period}"
+                }
             }
 
             result["pipeline_baselines"].append(pipeline_baseline)
 
-            # Categorize pipeline trends
-            if "improvement" in trend.lower():
+            # Categorize pipeline trends using trend_direction
+            if trend_direction == "improving":
                 result["performance_trends"]["improving_pipelines"].append({
                     "pipeline": namespace,
                     "trend": trend,
                     "avg_duration": avg_duration,
-                    "success_rate": success_rate
+                    "success_rate": success_rate,
+                    "duration_change_pct": duration_change_pct,
+                    "success_rate_change": success_change
                 })
-            elif "degradation" in trend.lower():
+            elif trend_direction == "degrading":
                 result["performance_trends"]["degrading_pipelines"].append({
                     "pipeline": namespace,
                     "trend": trend,
                     "avg_duration": avg_duration,
-                    "success_rate": success_rate
+                    "success_rate": success_rate,
+                    "duration_change_pct": duration_change_pct,
+                    "success_rate_change": success_change
                 })
-            elif "stable" in trend.lower():
+            elif trend_direction == "stable":
                 result["performance_trends"]["stable_pipelines"].append({
                     "pipeline": namespace,
                     "trend": trend,
@@ -7862,6 +8009,91 @@ async def ci_cd_performance_baselining_tool(
                     "complexity": "high",
                     "failure_rate": recon["failure_rate"]
                 })
+
+        # Task-level analysis if requested
+        if include_task_level:
+            logger.info("Performing task-level analysis...")
+            result["task_level_analysis"] = {
+                "task_baselines": [],
+                "slowest_tasks": [],
+                "most_failed_tasks": []
+            }
+
+            # Query task-level duration metrics by task name
+            task_duration_query = f"sum by (task, namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_sum[{baseline_period}])) / sum by (task, namespace) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}]))"
+            task_count_query = f"sum by (task, namespace, status) (increase(tekton_pipelines_controller_pipelinerun_taskrun_duration_seconds_count[{baseline_period}]))"
+
+            task_duration_result = await _execute_prometheus_query_internal(task_duration_query)
+            task_count_result = await _execute_prometheus_query_internal(task_count_query)
+
+            task_stats = {}
+
+            # Process task duration data
+            if task_duration_result.get("success"):
+                for item in task_duration_result.get("data", []):
+                    metric = item.get("metric", {})
+                    task_name = metric.get("task", "unknown")
+                    namespace = metric.get("namespace", "unknown")
+                    avg_duration = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+
+                    if np.isnan(avg_duration) or np.isinf(avg_duration):
+                        continue
+
+                    key = f"{namespace}/{task_name}"
+                    if key not in task_stats:
+                        task_stats[key] = {"task": task_name, "namespace": namespace, "avg_duration": 0, "success_count": 0, "failed_count": 0, "total_count": 0}
+                    task_stats[key]["avg_duration"] = avg_duration
+
+            # Process task count data
+            if task_count_result.get("success"):
+                for item in task_count_result.get("data", []):
+                    metric = item.get("metric", {})
+                    task_name = metric.get("task", "unknown")
+                    namespace = metric.get("namespace", "unknown")
+                    status = metric.get("status", "unknown")
+                    count = float(item.get("value", [0, 0])[1]) if isinstance(item.get("value"), list) else 0
+
+                    if np.isnan(count) or np.isinf(count):
+                        continue
+
+                    key = f"{namespace}/{task_name}"
+                    if key not in task_stats:
+                        task_stats[key] = {"task": task_name, "namespace": namespace, "avg_duration": 0, "success_count": 0, "failed_count": 0, "total_count": 0}
+
+                    if status == "success":
+                        task_stats[key]["success_count"] = count
+                    elif status == "failed":
+                        task_stats[key]["failed_count"] = count
+                    task_stats[key]["total_count"] += count
+
+            # Build task baselines and identify problem tasks
+            for key, stats in task_stats.items():
+                if stats["total_count"] < 1:
+                    continue
+
+                task_success_rate = (stats["success_count"] / stats["total_count"] * 100) if stats["total_count"] > 0 else 0
+
+                task_baseline = {
+                    "task": stats["task"],
+                    "namespace": stats["namespace"],
+                    "avg_duration_seconds": stats["avg_duration"],
+                    "total_runs": int(stats["total_count"]),
+                    "success_count": int(stats["success_count"]),
+                    "failed_count": int(stats["failed_count"]),
+                    "success_rate": task_success_rate
+                }
+                result["task_level_analysis"]["task_baselines"].append(task_baseline)
+
+            # Sort and get top slowest tasks
+            result["task_level_analysis"]["task_baselines"].sort(key=lambda x: x.get("avg_duration_seconds", 0), reverse=True)
+            result["task_level_analysis"]["slowest_tasks"] = result["task_level_analysis"]["task_baselines"][:10]
+
+            # Get most failed tasks (by failure count)
+            failed_tasks = [t for t in result["task_level_analysis"]["task_baselines"] if t["failed_count"] > 0]
+            failed_tasks.sort(key=lambda x: x["failed_count"], reverse=True)
+            result["task_level_analysis"]["most_failed_tasks"] = failed_tasks[:10]
+
+            logger.info(f"Task-level analysis completed: {len(result['task_level_analysis']['task_baselines'])} tasks analyzed")
 
         # Sort results for better presentation
         result["pipeline_baselines"].sort(key=lambda x: x.get("data_points", 0), reverse=True)
