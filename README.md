@@ -220,7 +220,7 @@ The server automatically detects Kubernetes configuration:
 | Tool | Description |
 |------|-------------|
 | `ci_cd_performance_baselining_tool` | Pipeline performance baselines |
-| `cross_cluster_pipeline_tracer` | Trace pipelines across clusters |
+| `pipeline_tracer` | Trace pipelines by commit, PR, or image |
 
 ### Topology & Prediction (2 tools)
 

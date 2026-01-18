@@ -7723,19 +7723,18 @@ async def ci_cd_performance_baselining_tool(
 
 
 @mcp.tool()
-async def cross_cluster_pipeline_tracer(
+async def pipeline_tracer(
     trace_identifier: str,
     trace_type: str,
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
-    cluster_sequence: Optional[List[str]] = None,
     include_artifacts: bool = True,
     trace_depth: str = "deep",
     namespaces: Optional[List[str]] = None,
     max_namespaces: int = 50
 ) -> Dict[str, Any]:
     """
-    Trace a logical operation (commit, PR, image) as it flows through pipelines across clusters.
+    Trace a logical operation (commit, PR, image) as it flows through pipelines.
 
     Correlates pipeline runs using labels, annotations, and artifact references.
 
@@ -7744,7 +7743,6 @@ async def cross_cluster_pipeline_tracer(
         trace_type: "commit", "pr", "image", or "custom".
         start_time: ISO 8601 start timestamp.
         end_time: ISO 8601 end timestamp.
-        cluster_sequence: Expected cluster progression order.
         include_artifacts: Include artifact details (default: True).
         trace_depth: "shallow" or "deep" (default: "deep").
         namespaces: Specific namespaces to search (skips auto-detection).
@@ -7754,7 +7752,7 @@ async def cross_cluster_pipeline_tracer(
         Dict: Pipeline flow, artifacts, bottlenecks, and summary.
     """
     try:
-        logger.info(f"Starting cross-cluster pipeline trace for {trace_type}: {trace_identifier}")
+        logger.info(f"Starting pipeline trace for {trace_type}: {trace_identifier}")
 
         # Validate inputs
         valid_trace_types = ["commit", "pr", "image", "custom"]
@@ -7861,7 +7859,7 @@ async def cross_cluster_pipeline_tracer(
         return result
 
     except Exception as e:
-        logger.error(f"Error in cross_cluster_pipeline_tracer: {str(e)}", exc_info=True)
+        logger.error(f"Error in pipeline_tracer: {str(e)}", exc_info=True)
         return {
             "error": f"Failed to trace pipeline: {str(e)}",
             "trace_id": f"{trace_type}:{trace_identifier}",
