@@ -7,6 +7,7 @@
 # coordination, and artifact tracking.
 # ============================================================================
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
@@ -40,58 +41,128 @@ async def correlate_pipeline_events(
     cluster_clients: Dict[str, Dict[str, Any]],
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
+    namespaces: Optional[List[str]] = None,
+    max_namespaces: int = 50,
+    tekton_namespaces: Optional[List[str]] = None,
     logger=None
 ) -> List[Dict[str, Any]]:
-    """Correlate pipeline runs across clusters using labels, annotations, and artifact references."""
+    """
+    Correlate pipeline runs across clusters using labels, annotations, and artifact references.
+
+    Args:
+        trace_identifier: The identifier to trace (commit SHA, PR number, image tag, etc.)
+        trace_type: Type of trace ("commit", "pr", "image", "custom")
+        cluster_clients: Dict of cluster clients with core_api, custom_api, apps_api
+        start_time: Optional start time filter (ISO 8601)
+        end_time: Optional end time filter (ISO 8601)
+        namespaces: Optional list of specific namespaces to search (skips auto-detection)
+        max_namespaces: Maximum namespaces to search when auto-detecting (default: 50)
+        tekton_namespaces: Optional list of known tekton-active namespaces for prioritization
+        logger: Optional logger instance
+
+    Returns:
+        List of pipeline info dicts with cluster, namespace, status, and metadata
+    """
     pipeline_flow = []
+
+    async def query_namespace(cluster_name: str, namespace: str, custom_api) -> List[Dict[str, Any]]:
+        """Query PipelineRuns in a single namespace - designed for parallel execution."""
+        results = []
+        try:
+            pipeline_runs = custom_api.list_namespaced_custom_object(
+                group="tekton.dev",
+                version="v1beta1",
+                namespace=namespace,
+                plural="pipelineruns"
+            )
+
+            for pr in pipeline_runs.get("items", []):
+                if matches_trace_identifier(pr, trace_identifier, trace_type):
+                    pipeline_info = {
+                        "cluster": cluster_name,
+                        "namespace": namespace,
+                        "pipeline_name": pr.get("metadata", {}).get("name", "unknown"),
+                        "pipeline_run_name": pr.get("metadata", {}).get("name", "unknown"),
+                        "status": get_pipeline_status(pr),
+                        "start_time": pr.get("status", {}).get("startTime"),
+                        "completion_time": pr.get("status", {}).get("completionTime"),
+                        "tasks": extract_task_info(pr),
+                        "labels": pr.get("metadata", {}).get("labels", {}),
+                        "annotations": pr.get("metadata", {}).get("annotations", {})
+                    }
+
+                    # Filter by time range if specified
+                    if in_time_range(pipeline_info, start_time, end_time):
+                        results.append(pipeline_info)
+
+        except Exception as e:
+            if logger:
+                logger.debug(f"Failed to query PipelineRuns in {cluster_name}/{namespace}: {e}")
+
+        return results
 
     for cluster_name, clients in cluster_clients.items():
         try:
             custom_api = clients["custom_api"]
 
-            # Get all namespaces in the cluster
-            namespaces = []
-            try:
-                ns_list = clients["core_api"].list_namespace()
-                namespaces = [ns.metadata.name for ns in ns_list.items]
-            except Exception as e:
-                if logger:
-                    logger.warning(f"Failed to list namespaces in cluster {cluster_name}: {e}")
-                continue
+            # Determine which namespaces to search
+            target_namespaces = []
 
-            for namespace in namespaces:
+            if namespaces:
+                # User specified exact namespaces - use them directly
+                target_namespaces = namespaces
+            else:
+                # Auto-detect namespaces with tekton prioritization
                 try:
-                    # Query PipelineRuns in each namespace
-                    pipeline_runs = custom_api.list_namespaced_custom_object(
-                        group="tekton.dev",
-                        version="v1beta1",
-                        namespace=namespace,
-                        plural="pipelineruns"
-                    )
+                    ns_list = clients["core_api"].list_namespace()
+                    all_namespaces = [ns.metadata.name for ns in ns_list.items]
 
-                    for pr in pipeline_runs.get("items", []):
-                        if matches_trace_identifier(pr, trace_identifier, trace_type):
-                            pipeline_info = {
-                                "cluster": cluster_name,
-                                "namespace": namespace,
-                                "pipeline_name": pr.get("metadata", {}).get("name", "unknown"),
-                                "pipeline_run_name": pr.get("metadata", {}).get("name", "unknown"),
-                                "status": get_pipeline_status(pr),
-                                "start_time": pr.get("status", {}).get("startTime"),
-                                "completion_time": pr.get("status", {}).get("completionTime"),
-                                "tasks": extract_task_info(pr),
-                                "labels": pr.get("metadata", {}).get("labels", {}),
-                                "annotations": pr.get("metadata", {}).get("annotations", {})
-                            }
-
-                            # Filter by time range if specified
-                            if in_time_range(pipeline_info, start_time, end_time):
-                                pipeline_flow.append(pipeline_info)
+                    if tekton_namespaces:
+                        # Prioritize tekton-active namespaces first
+                        tekton_set = set(tekton_namespaces)
+                        prioritized = [ns for ns in all_namespaces if ns in tekton_set]
+                        others = [ns for ns in all_namespaces if ns not in tekton_set]
+                        target_namespaces = (prioritized + others)[:max_namespaces]
+                    else:
+                        # No tekton hints - use heuristic prioritization
+                        # Prioritize namespaces likely to have pipelines
+                        pipeline_keywords = ['tenant', 'pipeline', 'tekton', 'cicd', 'ci-cd', 'build', 'konflux']
+                        prioritized = []
+                        others = []
+                        for ns in all_namespaces:
+                            if any(kw in ns.lower() for kw in pipeline_keywords):
+                                prioritized.append(ns)
+                            else:
+                                others.append(ns)
+                        target_namespaces = (prioritized + others)[:max_namespaces]
 
                 except Exception as e:
                     if logger:
-                        logger.debug(f"Failed to query PipelineRuns in {cluster_name}/{namespace}: {e}")
+                        logger.warning(f"Failed to list namespaces in cluster {cluster_name}: {e}")
                     continue
+
+            if not target_namespaces:
+                continue
+
+            if logger:
+                logger.info(f"Searching {len(target_namespaces)} namespaces in cluster {cluster_name}")
+
+            # Parallelize namespace queries using asyncio.gather
+            tasks = [
+                asyncio.create_task(query_namespace(cluster_name, ns, custom_api))
+                for ns in target_namespaces
+            ]
+
+            # Execute all namespace queries in parallel
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Collect results, handling any exceptions
+            for result in results:
+                if isinstance(result, Exception):
+                    if logger:
+                        logger.debug(f"Namespace query failed: {result}")
+                elif isinstance(result, list):
+                    pipeline_flow.extend(result)
 
         except Exception as e:
             if logger:

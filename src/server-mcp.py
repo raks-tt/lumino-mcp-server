@@ -7730,7 +7730,9 @@ async def cross_cluster_pipeline_tracer(
     end_time: Optional[str] = None,
     cluster_sequence: Optional[List[str]] = None,
     include_artifacts: bool = True,
-    trace_depth: str = "deep"
+    trace_depth: str = "deep",
+    namespaces: Optional[List[str]] = None,
+    max_namespaces: int = 50
 ) -> Dict[str, Any]:
     """
     Trace a logical operation (commit, PR, image) as it flows through pipelines across clusters.
@@ -7745,6 +7747,8 @@ async def cross_cluster_pipeline_tracer(
         cluster_sequence: Expected cluster progression order.
         include_artifacts: Include artifact details (default: True).
         trace_depth: "shallow" or "deep" (default: "deep").
+        namespaces: Specific namespaces to search (skips auto-detection).
+        max_namespaces: Maximum namespaces to search when auto-detecting (default: 50).
 
     Returns:
         Dict: Pipeline flow, artifacts, bottlenecks, and summary.
@@ -7773,9 +7777,30 @@ async def cross_cluster_pipeline_tracer(
                 "error": "No cluster clients available for tracing"
             }
 
-        # Correlate pipeline events across clusters
+        # Detect tekton-active namespaces for prioritization (if not user-specified)
+        tekton_ns_list = None
+        if not namespaces:
+            try:
+                tekton_ns = await detect_tekton_namespaces()
+                tekton_ns_list = []
+                for category in tekton_ns.values():
+                    tekton_ns_list.extend(category)
+                tekton_ns_list = list(set(tekton_ns_list))
+                logger.info(f"Detected {len(tekton_ns_list)} tekton-active namespaces for prioritization")
+            except Exception as e:
+                logger.debug(f"Failed to detect tekton namespaces: {e}")
+
+        # Correlate pipeline events across clusters (parallelized)
         pipeline_flow = await correlate_pipeline_events(
-            trace_identifier, trace_type, cluster_clients, start_time, end_time, logger
+            trace_identifier=trace_identifier,
+            trace_type=trace_type,
+            cluster_clients=cluster_clients,
+            start_time=start_time,
+            end_time=end_time,
+            namespaces=namespaces,
+            max_namespaces=max_namespaces,
+            tekton_namespaces=tekton_ns_list,
+            logger=logger
         )
 
         # Track artifacts if requested
