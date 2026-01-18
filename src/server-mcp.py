@@ -8892,7 +8892,9 @@ async def predictive_log_analyzer(
     log_sources: Optional[List[str]] = None,
     failure_types: Optional[List[str]] = None,
     historical_data_range: str = "30d",
-    model_refresh_interval: str = "24h"
+    model_refresh_interval: str = "24h",
+    namespaces: Optional[List[str]] = None,
+    max_namespaces: int = 20
 ) -> Dict[str, Any]:
     """
     Predict failures using ML analysis of historical log patterns before critical outages occur.
@@ -8906,6 +8908,8 @@ async def predictive_log_analyzer(
         failure_types: Types to predict - pod_crash, resource_exhaustion, network_issues.
         historical_data_range: Historical data period (default: "30d").
         model_refresh_interval: Model retrain frequency (default: "24h").
+        namespaces: Specific namespaces to analyze (default: auto-detect active namespaces).
+        max_namespaces: Maximum namespaces to scan when auto-detecting (default: 20).
 
     Returns:
         Dict: Keys: predictions, model_performance, anomaly_scores, trend_analysis.
@@ -8945,17 +8949,36 @@ async def predictive_log_analyzer(
         for source in log_sources:
             try:
                 if source == "pods":
-                    # Get logs from recent failed pods
-                    namespaces = await list_namespaces()
-                    for namespace in namespaces[:5]:  # Limit to 5 namespaces for performance
+                    # Determine target namespaces
+                    if namespaces:
+                        # Use user-provided namespaces
+                        target_namespaces = namespaces
+                        logger.info(f"Using user-specified namespaces: {target_namespaces}")
+                    else:
+                        # Auto-detect active namespaces, prioritizing those with tekton/pipeline activity
+                        all_ns = await list_namespaces()
                         try:
-                            pods = k8s_core_api.list_namespaced_pod(namespace=namespace, limit=10)
+                            tekton_ns = await detect_tekton_namespaces()
+                            active_ns = []
+                            for category in tekton_ns.values():
+                                active_ns.extend(category)
+                            # Deduplicate and limit
+                            target_namespaces = list(set(active_ns))[:max_namespaces] if active_ns else all_ns[:max_namespaces]
+                        except Exception:
+                            # Fallback to alphabetical if tekton detection fails
+                            target_namespaces = all_ns[:max_namespaces]
+                        logger.info(f"Auto-detected {len(target_namespaces)} active namespaces")
+
+                    for ns in target_namespaces:
+                        try:
+                            pods = k8s_core_api.list_namespaced_pod(namespace=ns, limit=50)
                             for pod in pods.items:
-                                if pod.status.phase in ["Failed", "Succeeded"]:
+                                # Include Running pods for proactive analysis, plus Failed/Succeeded for historical
+                                if pod.status.phase in ["Running", "Failed", "Succeeded"]:
                                     try:
                                         pod_logs = k8s_core_api.read_namespaced_pod_log(
                                             name=pod.metadata.name,
-                                            namespace=namespace,
+                                            namespace=ns,
                                             tail_lines=100
                                         )
                                         all_logs.extend(pod_logs.split('\n'))
