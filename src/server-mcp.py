@@ -2677,7 +2677,14 @@ async def track_pipeline_across_namespaces(pipeline_id: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
+async def find_pipeline(
+    pipeline_id_pattern: str,
+    include_taskruns: bool = False,
+    max_results: int = 100,
+    namespaces: Optional[List[str]] = None,
+    pipeline_runs_limit: int = 1000,
+    task_runs_limit: int = 500
+) -> Dict[str, Any]:
     """
     Find Tekton pipelines matching a pattern across all accessible namespaces.
 
@@ -2685,6 +2692,11 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
 
     Args:
         pipeline_id_pattern: Pattern to match (partial name, label value, or substring).
+        include_taskruns: Include TaskRuns in search results (default: False for performance).
+        max_results: Maximum matching results to return per resource type (default: 100).
+        namespaces: Optional list of namespaces to search (default: all namespaces).
+        pipeline_runs_limit: Max PipelineRuns to fetch from API (default: 1000).
+        task_runs_limit: Max TaskRuns to fetch from API if include_taskruns=True (default: 500).
 
     Returns:
         Dict[str, Any]: Keys: pipeline_runs, task_runs, pipelines_as_code, all_namespaces_checked,
@@ -2700,29 +2712,55 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
     }
 
     try:
-        logger.info(f"Searching for pipeline pattern '{pipeline_id_pattern}' using cluster-wide queries")
+        logger.info(f"Searching for pipeline pattern '{pipeline_id_pattern}' (include_taskruns={include_taskruns}, max_results={max_results})")
         pattern_lower = pipeline_id_pattern.lower()
 
         # Use ThreadPoolExecutor for parallel API calls
         loop = asyncio.get_event_loop()
         executor = ThreadPoolExecutor(max_workers=3)
 
-        def fetch_pipelineruns():
+        def fetch_pipelineruns_namespaced(ns: str):
             try:
-                return k8s_custom_api.list_cluster_custom_object(
+                return k8s_custom_api.list_namespaced_custom_object(
                     group="tekton.dev",
                     version="v1",
-                    plural="pipelineruns"
+                    namespace=ns,
+                    plural="pipelineruns",
+                    limit=pipeline_runs_limit
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
 
-        def fetch_taskruns():
+        def fetch_pipelineruns_cluster():
             try:
                 return k8s_custom_api.list_cluster_custom_object(
                     group="tekton.dev",
                     version="v1",
-                    plural="taskruns"
+                    plural="pipelineruns",
+                    limit=pipeline_runs_limit
+                )
+            except ApiException as e:
+                return {"error": str(e), "items": []}
+
+        def fetch_taskruns_namespaced(ns: str):
+            try:
+                return k8s_custom_api.list_namespaced_custom_object(
+                    group="tekton.dev",
+                    version="v1",
+                    namespace=ns,
+                    plural="taskruns",
+                    limit=task_runs_limit
+                )
+            except ApiException as e:
+                return {"error": str(e), "items": []}
+
+        def fetch_taskruns_cluster():
+            try:
+                return k8s_custom_api.list_cluster_custom_object(
+                    group="tekton.dev",
+                    version="v1",
+                    plural="taskruns",
+                    limit=task_runs_limit
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -2732,27 +2770,67 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
                 return k8s_custom_api.list_cluster_custom_object(
                     group="pipelinesascode.tekton.dev",
                     version="v1alpha1",
-                    plural="repositories"
+                    plural="repositories",
+                    limit=500
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
 
-        # Execute all 3 API calls in parallel
-        pr_future = loop.run_in_executor(executor, fetch_pipelineruns)
-        tr_future = loop.run_in_executor(executor, fetch_taskruns)
-        repo_future = loop.run_in_executor(executor, fetch_repositories)
+        # Fetch based on namespace targeting
+        if namespaces:
+            # Targeted namespace search - fetch from specific namespaces in parallel
+            logger.info(f"Searching in {len(namespaces)} specified namespaces")
+            pr_futures = [loop.run_in_executor(executor, fetch_pipelineruns_namespaced, ns) for ns in namespaces]
+            pipeline_runs_resps = await asyncio.gather(*pr_futures)
+            pipeline_runs_resp = {"items": []}
+            for resp in pipeline_runs_resps:
+                if "error" not in resp:
+                    pipeline_runs_resp["items"].extend(resp.get("items", []))
+                else:
+                    pipeline_runs_resp["error"] = resp.get("error")
 
-        pipeline_runs_resp, task_runs_resp, repositories_resp = await asyncio.gather(
-            pr_future, tr_future, repo_future
-        )
+            if include_taskruns:
+                tr_futures = [loop.run_in_executor(executor, fetch_taskruns_namespaced, ns) for ns in namespaces]
+                task_runs_resps = await asyncio.gather(*tr_futures)
+                task_runs_resp = {"items": []}
+                for resp in task_runs_resps:
+                    if "error" not in resp:
+                        task_runs_resp["items"].extend(resp.get("items", []))
+                    else:
+                        task_runs_resp["error"] = resp.get("error")
+            else:
+                task_runs_resp = {"items": [], "skipped": True}
 
-        # Track namespaces found
+            repo_future = loop.run_in_executor(executor, fetch_repositories)
+            repositories_resp = await repo_future
+        else:
+            # Cluster-wide search with limits
+            pr_future = loop.run_in_executor(executor, fetch_pipelineruns_cluster)
+            repo_future = loop.run_in_executor(executor, fetch_repositories)
+
+            if include_taskruns:
+                tr_future = loop.run_in_executor(executor, fetch_taskruns_cluster)
+                pipeline_runs_resp, task_runs_resp, repositories_resp = await asyncio.gather(
+                    pr_future, tr_future, repo_future
+                )
+            else:
+                pipeline_runs_resp, repositories_resp = await asyncio.gather(pr_future, repo_future)
+                task_runs_resp = {"items": [], "skipped": True}
+
+        # Track namespaces found and counts for sampling info
         namespaces_seen = set()
+        pr_total_scanned = 0
+        tr_total_scanned = 0
+        pr_matches_truncated = False
+        tr_matches_truncated = False
 
-        # Process PipelineRuns
+        # Process PipelineRuns with max_results limit
         if "error" in pipeline_runs_resp:
             results["diagnostic_info"]["pipelineruns_error"] = pipeline_runs_resp["error"]
-        for pr in pipeline_runs_resp.get("items", []):
+
+        pr_items = pipeline_runs_resp.get("items", [])
+        for pr in pr_items:
+            pr_total_scanned += 1
             namespace = pr.get("metadata", {}).get("namespace", "")
             namespaces_seen.add(namespace)
             pr_name = pr.get("metadata", {}).get("name", "")
@@ -2760,6 +2838,9 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
 
             if (pattern_lower in pr_name.lower() or
                     any(pattern_lower in str(v).lower() for v in labels.values())):
+                if len(results["pipeline_runs"]) >= max_results:
+                    pr_matches_truncated = True
+                    break  # Stop processing once max_results reached
                 status = pr.get("status", {})
                 conditions = status.get("conditions", [{}])
                 condition = conditions[0] if conditions else {}
@@ -2774,32 +2855,41 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
                     "labels": labels
                 })
 
-        # Process TaskRuns
-        if "error" in task_runs_resp:
-            results["diagnostic_info"]["taskruns_error"] = task_runs_resp["error"]
-        for tr in task_runs_resp.get("items", []):
-            namespace = tr.get("metadata", {}).get("namespace", "")
-            namespaces_seen.add(namespace)
-            tr_name = tr.get("metadata", {}).get("name", "")
-            labels = tr.get("metadata", {}).get("labels", {})
-            pipeline_run = labels.get("tekton.dev/pipelineRun", "")
+        # Process TaskRuns only if include_taskruns is True
+        if task_runs_resp.get("skipped"):
+            results["diagnostic_info"]["taskruns_skipped"] = "Set include_taskruns=True to search TaskRuns"
+        else:
+            if "error" in task_runs_resp:
+                results["diagnostic_info"]["taskruns_error"] = task_runs_resp["error"]
 
-            if (pattern_lower in tr_name.lower() or
-                pattern_lower in pipeline_run.lower() or
-                    any(pattern_lower in str(v).lower() for v in labels.values())):
-                status = tr.get("status", {})
-                conditions = status.get("conditions", [{}])
-                condition = conditions[0] if conditions else {}
+            tr_items = task_runs_resp.get("items", [])
+            for tr in tr_items:
+                tr_total_scanned += 1
+                namespace = tr.get("metadata", {}).get("namespace", "")
+                namespaces_seen.add(namespace)
+                tr_name = tr.get("metadata", {}).get("name", "")
+                labels = tr.get("metadata", {}).get("labels", {})
+                pipeline_run = labels.get("tekton.dev/pipelineRun", "")
 
-                results["task_runs"].append({
-                    "namespace": namespace,
-                    "name": tr_name,
-                    "pipeline_run": pipeline_run,
-                    "status": condition.get("reason", "Unknown"),
-                    "message": condition.get("message", ""),
-                    "pod_name": status.get("podName", "unknown"),
-                    "labels": labels
-                })
+                if (pattern_lower in tr_name.lower() or
+                    pattern_lower in pipeline_run.lower() or
+                        any(pattern_lower in str(v).lower() for v in labels.values())):
+                    if len(results["task_runs"]) >= max_results:
+                        tr_matches_truncated = True
+                        break  # Stop processing once max_results reached
+                    status = tr.get("status", {})
+                    conditions = status.get("conditions", [{}])
+                    condition = conditions[0] if conditions else {}
+
+                    results["task_runs"].append({
+                        "namespace": namespace,
+                        "name": tr_name,
+                        "pipeline_run": pipeline_run,
+                        "status": condition.get("reason", "Unknown"),
+                        "message": condition.get("message", ""),
+                        "pod_name": status.get("podName", "unknown"),
+                        "labels": labels
+                    })
 
         # Process Repositories
         if "error" in repositories_resp:
@@ -2821,11 +2911,17 @@ async def find_pipeline(pipeline_id_pattern: str) -> Dict[str, Any]:
 
         results["all_namespaces_checked"] = sorted(namespaces_seen)
 
-        # Add summary
+        # Add summary with sampling info
         results["summary"] = {
             "pipeline_runs_found": len(results["pipeline_runs"]),
             "task_runs_found": len(results["task_runs"]),
-            "namespaces_with_tekton_resources": len(namespaces_seen)
+            "namespaces_with_tekton_resources": len(namespaces_seen),
+            "pipeline_runs_scanned": pr_total_scanned,
+            "task_runs_scanned": tr_total_scanned,
+            "pipeline_runs_truncated": pr_matches_truncated,
+            "task_runs_truncated": tr_matches_truncated,
+            "include_taskruns": include_taskruns,
+            "max_results_limit": max_results
         }
 
         logger.info(f"Pipeline search complete: {results['summary']}")
