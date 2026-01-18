@@ -10,10 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 #### Core Infrastructure
-- Initial release of Lumino MCP Server
+- Initial release of Lumino MCP Server with **37 MCP tools**
 - MCP (Model Context Protocol) integration for AI-powered Kubernetes operations
 - Multi-cluster support with automatic context detection
 - Prometheus integration for metrics queries
+- Namespace caching with 1-day TTL for performance
 
 #### Kubernetes Tools
 - `list_namespaces` - List all namespaces in the cluster
@@ -69,6 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Prometheus Integration
 - `prometheus_query` - Execute PromQL queries with automatic auth
+
+### Performance Optimizations
+- `find_pipeline` - Cluster-wide queries with API limits and optional TaskRun fetching
+- `ci_cd_performance_baselining_tool` - Parallelized Prometheus queries
+- `get_tekton_pipeline_runs_status` - Configurable limits to prevent timeouts on large clusters
+- `pipeline_tracer` - Parallelization and namespace targeting
+- `predictive_log_analyzer` - Namespace targeting and improved log collection
 
 ### Container Image
 - Available at `quay.io/geored/lumino-mcp-server`
