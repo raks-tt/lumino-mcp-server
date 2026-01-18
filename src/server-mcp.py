@@ -347,7 +347,7 @@ _prometheus_endpoint_cache = PrometheusEndpointCache()
 
 # Namespace cache for avoiding repeated API calls
 _namespace_cache = {"namespaces": None, "timestamp": 0}
-_NAMESPACE_CACHE_TTL = 60  # seconds
+_NAMESPACE_CACHE_TTL = 86400  # 1 day in seconds
 
 
 def _is_running_in_cluster() -> bool:
