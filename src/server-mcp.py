@@ -5609,12 +5609,18 @@ async def investigate_tls_certificate_issues(
                         max_context_tokens=3000
                     )
 
-                    if "events" in events_result:
+                    if "events" in events_result and events_result["events"]:
                         for event in events_result["events"][:5]:  # Top 5 events
                             event_content = event.get("event_string", "").lower()
-                            if any(cert_pattern in event_content for cert_pattern in [
-                                "certificate", "tls", "x509", "ssl", "handshake"
-                            ]):
+
+                            tls_patterns = ["certificate", "tls", "x509", "ssl", "handshake"]
+                            matched_pattern = None
+                            for pattern in tls_patterns:
+                                if pattern in event_content:
+                                    matched_pattern = pattern
+                                    break
+
+                            if matched_pattern:
                                 certificate_problems.append({
                                     "namespace": namespace,
                                     "event_type": "kubernetes_event",
