@@ -1479,14 +1479,16 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
     """
     Check for resource constraints in a namespace that may impact pipelines.
 
-    Identifies: high CPU/memory usage, pending pods, OOMKilled containers, quota issues.
+    Identifies: pending/unschedulable pods, OOMKilled containers, CrashLoopBackOff,
+    ImagePullBackOff, high restart counts, and resource quota utilization.
 
     Args:
         namespace: Kubernetes namespace to inspect.
 
     Returns:
         Dict[str, Any]: Keys: status (Healthy/Warning/Critical/Error), summary, resource_quotas,
-                        pending_pods_due_to_resources, high_resource_utilization_pods, recommendations.
+                        pending_pods_due_to_resources, oom_killed_containers, container_issues,
+                        high_utilization_quotas, recommendations.
     """
     try:
         # Get pods in the namespace
@@ -1497,25 +1499,78 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
 
         # Check for resource problems in pod status
         resource_issues = []
+        pending_pods = []
+        oom_killed_pods = []
 
         for pod in pods:
-            if pod.get("status") == "Failed" or pod.get("status") == "Pending":
-                pod_name = pod.get("name")
+            pod_name = pod.get("name")
+            pod_status = pod.get("status")
+
+            # Check for pending pods (potential scheduling issues)
+            if pod_status == "Pending":
+                detailed_pod = k8s_core_api.read_namespaced_pod(
+                    name=pod_name, namespace=namespace)
+
+                # Check conditions for scheduling failures
+                if detailed_pod.status.conditions:
+                    for condition in detailed_pod.status.conditions:
+                        if condition.type == "PodScheduled" and condition.status == "False":
+                            pending_pods.append({
+                                "pod": pod_name,
+                                "issue": "Unschedulable",
+                                "reason": condition.reason or "Unknown",
+                                "message": condition.message or ""
+                            })
+                            break
+                    else:
+                        # No specific scheduling condition found, still pending
+                        pending_pods.append({
+                            "pod": pod_name,
+                            "issue": "Pending",
+                            "reason": "Unknown",
+                            "message": "Pod is pending without specific reason"
+                        })
+
+            # Check for failed or problematic pods
+            if pod_status in ["Failed", "Pending", "Running"]:
                 detailed_pod = k8s_core_api.read_namespaced_pod(
                     name=pod_name, namespace=namespace)
 
                 if hasattr(detailed_pod.status, "container_statuses") and detailed_pod.status.container_statuses:
                     for container_status in detailed_pod.status.container_statuses:
-                        if hasattr(container_status, "state") and hasattr(container_status.state, "waiting"):
+                        # Check current state for waiting issues
+                        if hasattr(container_status, "state") and container_status.state:
                             if container_status.state.waiting:
                                 reason = container_status.state.waiting.reason
-                                if reason in ["CrashLoopBackOff", "OOMKilled"]:
+                                if reason in ["CrashLoopBackOff", "OOMKilled", "ImagePullBackOff", "ErrImagePull", "CreateContainerError", "CreateContainerConfigError", "ContainerCreating"]:
                                     resource_issues.append({
                                         "pod": pod_name,
                                         "container": container_status.name,
                                         "issue": reason,
-                                        "message": container_status.state.waiting.message if hasattr(container_status.state.waiting, "message") else ""
+                                        "message": container_status.state.waiting.message or ""
                                     })
+
+                        # Check last_state for OOMKilled (container restarted after OOM)
+                        if hasattr(container_status, "last_state") and container_status.last_state:
+                            if container_status.last_state.terminated:
+                                if container_status.last_state.terminated.reason == "OOMKilled":
+                                    oom_killed_pods.append({
+                                        "pod": pod_name,
+                                        "container": container_status.name,
+                                        "issue": "OOMKilled",
+                                        "restart_count": container_status.restart_count,
+                                        "message": f"Container was OOMKilled and restarted {container_status.restart_count} times"
+                                    })
+
+                        # Check for high restart counts (potential resource issues)
+                        if container_status.restart_count and container_status.restart_count > 5:
+                            resource_issues.append({
+                                "pod": pod_name,
+                                "container": container_status.name,
+                                "issue": "HighRestartCount",
+                                "restart_count": container_status.restart_count,
+                                "message": f"Container has restarted {container_status.restart_count} times"
+                            })
 
         # Format resource quotas
         quota_data = []
@@ -1547,21 +1602,51 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
 
         # Determine overall status
         status = "Healthy"
-        summary = "No significant resource constraints detected"
+        summary_parts = []
 
+        total_issues = len(resource_issues) + len(pending_pods) + len(oom_killed_pods)
+
+        if oom_killed_pods:
+            status = "Critical"
+            summary_parts.append(f"{len(oom_killed_pods)} OOMKilled containers")
+        if pending_pods:
+            status = "Critical" if status != "Critical" else status
+            summary_parts.append(f"{len(pending_pods)} pending/unschedulable pods")
         if resource_issues:
-            status = "Critical" if len(resource_issues) > 5 else "Warning"
-            summary = f"Found {len(resource_issues)} resource-related issues"
-        elif high_utilization:
-            status = "Warning"
-            summary = f"High resource utilization detected in {len(high_utilization)} quotas"
+            status = "Warning" if status == "Healthy" else status
+            summary_parts.append(f"{len(resource_issues)} container issues")
+        if high_utilization:
+            status = "Warning" if status == "Healthy" else status
+            summary_parts.append(f"{len(high_utilization)} quotas with high utilization")
+
+        if summary_parts:
+            summary = f"Found: {', '.join(summary_parts)}"
+        else:
+            summary = "No significant resource constraints detected"
 
         # Generate recommendations
         recommendations = []
+        if oom_killed_pods:
+            recommendations.append("Increase memory limits for OOMKilled containers")
+            recommendations.append("Review application memory usage patterns")
+        if pending_pods:
+            unschedulable = [p for p in pending_pods if p.get("issue") == "Unschedulable"]
+            if unschedulable:
+                recommendations.append("Check node resources - pods cannot be scheduled due to insufficient resources")
+            recommendations.append("Review pending pods and their resource requests")
         if resource_issues:
-            recommendations.append("Investigate pods with resource-related failures")
-            if any(issue["issue"] == "OOMKilled" for issue in resource_issues):
-                recommendations.append("Consider increasing memory limits for affected containers")
+            crash_loops = [i for i in resource_issues if i.get("issue") == "CrashLoopBackOff"]
+            image_issues = [i for i in resource_issues if i.get("issue") in ["ImagePullBackOff", "ErrImagePull"]]
+            config_errors = [i for i in resource_issues if i.get("issue") in ["CreateContainerError", "CreateContainerConfigError"]]
+            high_restarts = [i for i in resource_issues if i.get("issue") == "HighRestartCount"]
+            if crash_loops:
+                recommendations.append("Investigate CrashLoopBackOff containers - check logs for errors")
+            if image_issues:
+                recommendations.append("Fix image pull issues - verify image names and registry access")
+            if config_errors:
+                recommendations.append("Fix container configuration errors - check secrets, configmaps, and volume mounts")
+            if high_restarts:
+                recommendations.append("Investigate containers with high restart counts")
         if high_utilization:
             recommendations.append("Monitor resource quota usage and consider increasing limits")
 
@@ -1569,15 +1654,10 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
             "status": status,
             "summary": summary,
             "resource_quotas": quota_data,
-            "pending_pods_due_to_resources": [
-                issue for issue in resource_issues
-                if issue["issue"] in ["Pending", "ImagePullBackOff"]
-            ],
-            "high_resource_utilization_pods": [
-                issue for issue in resource_issues
-                if issue["issue"] == "OOMKilled"
-            ],
-            "node_resource_pressure": [],
+            "pending_pods_due_to_resources": pending_pods,
+            "oom_killed_containers": oom_killed_pods,
+            "container_issues": resource_issues,
+            "high_utilization_quotas": high_utilization,
             "recommendations": recommendations
         }
 
@@ -1588,8 +1668,9 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
             "summary": f"Kubernetes API error: {str(e)}",
             "resource_quotas": [],
             "pending_pods_due_to_resources": [],
-            "high_resource_utilization_pods": [],
-            "node_resource_pressure": [],
+            "oom_killed_containers": [],
+            "container_issues": [],
+            "high_utilization_quotas": [],
             "recommendations": ["Check cluster connectivity and permissions"],
             "error": str(e)
         }
@@ -1600,8 +1681,9 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
             "summary": f"Unexpected error: {str(e)}",
             "resource_quotas": [],
             "pending_pods_due_to_resources": [],
-            "high_resource_utilization_pods": [],
-            "node_resource_pressure": [],
+            "oom_killed_containers": [],
+            "container_issues": [],
+            "high_utilization_quotas": [],
             "recommendations": ["Review logs for detailed error information"],
             "error": str(e)
         }
