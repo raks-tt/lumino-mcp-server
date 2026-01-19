@@ -6,6 +6,27 @@
 
 An open source MCP (Model Context Protocol) server providing AI-powered tools for Kubernetes, OpenShift, and Tekton monitoring, analysis, and troubleshooting.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Usage Examples](#usage-examples)
+- [Configuration](#configuration)
+- [Available Tools](#available-tools)
+- [Architecture](#architecture)
+- [How It Works](#how-it-works)
+- [MCP Client Integration](#mcp-client-integration)
+- [Performance Considerations](#performance-considerations)
+- [Troubleshooting](#troubleshooting)
+- [Dependencies](#dependencies)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
+
 ## Overview
 
 LUMINO MCP Server transforms how Site Reliability Engineers (SREs) and DevOps teams interact with Kubernetes clusters. By exposing 37 specialized tools through the Model Context Protocol, it enables AI assistants to:
@@ -58,11 +79,52 @@ LUMINO MCP Server transforms how Site Reliability Engineers (SREs) and DevOps te
 - Risk assessment with configurable tolerance
 - Affected component identification
 
-## Requirements
+## Quick Start
 
-- Python 3.10+
-- Access to a Kubernetes/OpenShift cluster (for Kubernetes tools)
-- [uv](https://docs.astral.sh/uv/) for dependency management (recommended)
+Get started with LUMINO in under 2 minutes:
+
+### For Claude Code CLI Users (Easiest)
+
+Simply ask Claude Code:
+
+```
+Provision the Lumino MCP server from https://github.com/spre-sre/lumino-mcp-server as an MCP integration for this Claude Code project
+```
+
+Claude will automatically clone, configure, and integrate the server into your project.
+
+### For Other MCP Clients
+
+Choose your preferred installation method:
+- **MCPM (Recommended)**: `mcpm install @spre-sre/lumino-mcp-server`
+- **Manual Setup**: See detailed [MCP Client Integration](#mcp-client-integration) instructions
+
+### Verify Installation
+
+Once installed, test with a simple query:
+
+```
+"List all namespaces in my Kubernetes cluster"
+```
+
+## Prerequisites
+
+### Required
+- **Python 3.10 or higher** - Core runtime
+- **MCP Client** - One of:
+  - [Claude Desktop](https://claude.ai/download)
+  - [Claude Code CLI](https://github.com/anthropics/claude-code)
+  - [Gemini CLI](https://github.com/google/generative-ai-cli)
+  - [Cursor IDE](https://cursor.sh/)
+
+### For Kubernetes Features
+- **Kubernetes/OpenShift Access** - Valid kubeconfig with read permissions
+- **RBAC Permissions** - Ability to list pods, namespaces, and other resources
+
+### Optional (Recommended)
+- **[uv](https://docs.astral.sh/uv/)** - Faster dependency management than pip
+- **[MCPM](https://github.com/spre-sre/mcpm)** - Easiest installation experience
+- **Prometheus** - For advanced metrics and forecasting features
 
 ## Installation
 
@@ -119,6 +181,184 @@ python main.py
 
 The server automatically detects the environment and switches transport modes.
 
+## Usage Examples
+
+### 🔍 Intelligent Root Cause Analysis
+
+Investigate and diagnose complex failures with automated analysis:
+
+```
+"Generate a comprehensive RCA report for the failed pipeline run 'build-api-pr-456' in namespace ci-cd"
+```
+
+```
+"Analyze what caused pod crashes in namespace production over the last 6 hours and correlate with resource events"
+```
+
+```
+"Investigate the TLS certificate issues affecting services in namespace ingress-nginx"
+```
+
+### 🎯 Predictive Intelligence & Forecasting
+
+Anticipate problems before they impact your systems:
+
+```
+"Predict resource bottlenecks across all production namespaces for the next 48 hours"
+```
+
+```
+"Analyze historical pipeline performance and detect anomalies in build times for the last 30 days"
+```
+
+```
+"Check cluster certificate health and alert me about any certificates expiring in the next 60 days"
+```
+
+```
+"Use predictive log analysis to identify potential failures in namespace monitoring before they occur"
+```
+
+### 🧪 Simulation & What-If Analysis
+
+Test changes safely before applying them to production:
+
+```
+"Simulate the impact of increasing memory limits to 4Gi for all pods in namespace backend-services"
+```
+
+```
+"Run a what-if scenario for scaling deployments to 10 replicas and analyze resource consumption"
+```
+
+```
+"Simulate configuration changes for nginx ingress controller and assess risk to existing traffic"
+```
+
+### 🗺️ Topology & Dependency Mapping
+
+Understand system architecture and component relationships:
+
+```
+"Generate a live topology map of all services, deployments, and their dependencies in namespace microservices"
+```
+
+```
+"Map the complete dependency graph for the payment-service including all connected resources"
+```
+
+```
+"Show me the topology of components affected by the cert-manager service"
+```
+
+### 🔬 Advanced Investigation & Forensics
+
+Deep-dive into complex issues with multi-faceted analysis:
+
+```
+"Perform an adaptive namespace investigation for production - analyze logs, events, and resource patterns"
+```
+
+```
+"Create a detailed investigation report for resource constraints and bottlenecks in namespace data-processing"
+```
+
+```
+"Trace pipeline execution for commit SHA abc123def from source to deployment across all namespaces"
+```
+
+```
+"Search logs semantically for 'authentication failures related to expired tokens' across the last 24 hours"
+```
+
+### 📊 CI/CD Pipeline Intelligence
+
+Optimize and troubleshoot your continuous delivery pipelines:
+
+```
+"Establish performance baselines for all Tekton pipelines and flag runs deviating by more than 2 standard deviations"
+```
+
+```
+"Trace the complete pipeline flow for image 'api:v2.5.3' from build to production deployment"
+```
+
+```
+"Analyze failed pipeline runs in namespace tekton-pipelines and identify common failure patterns"
+```
+
+```
+"Compare current pipeline run times against 30-day baseline and highlight performance degradation"
+```
+
+### 🎨 Progressive Event Analysis
+
+Multi-level event investigation from overview to deep-dive:
+
+```
+"Start with an overview of events in namespace kube-system, then drill down into critical issues"
+```
+
+```
+"Perform advanced event analytics with ML pattern detection for namespace monitoring over the last 12 hours"
+```
+
+```
+"Correlate events with pod logs to identify the root cause of CrashLoopBackOff in namespace applications"
+```
+
+### 🚀 Real-Time Monitoring & Alerts
+
+Stay informed about cluster health and pipeline status:
+
+```
+"Show me the status of all Tekton pipeline runs cluster-wide and highlight long-running pipelines"
+```
+
+```
+"List all failed TaskRuns in the last hour with error details and recommended actions"
+```
+
+```
+"Monitor OpenShift cluster operators and alert on any degraded components"
+```
+
+```
+"Check MachineConfigPool status and show which nodes are being updated"
+```
+
+### 🔐 Security & Compliance
+
+Ensure cluster security and certificate management:
+
+```
+"Scan all namespaces for expiring certificates and generate a renewal schedule"
+```
+
+```
+"Investigate TLS certificate issues causing handshake failures in namespace istio-system"
+```
+
+```
+"Audit all secrets and configmaps for sensitive data exposure patterns"
+```
+
+### 📈 Advanced Analytics & ML Insights
+
+Leverage machine learning for pattern detection:
+
+```
+"Use streaming log analysis to process large log volumes from namespace data-pipeline with error pattern detection"
+```
+
+```
+"Detect anomalies in log patterns using ML analysis with medium severity threshold for namespace api-gateway"
+```
+
+```
+"Analyze resource utilization trends using Prometheus metrics and forecast capacity needs"
+```
+
 ## Configuration
 
 ### Kubernetes Authentication
@@ -130,11 +370,15 @@ The server automatically detects Kubernetes configuration:
 
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `KUBERNETES_NAMESPACE` | Namespace for K8s mode | - |
-| `K8S_NAMESPACE` | Alternative namespace variable | - |
-| `PROMETHEUS_URL` | Prometheus server URL for metrics | Auto-detected |
+| Variable | Description | Default | When to Use |
+|----------|-------------|---------|-------------|
+| `KUBERNETES_NAMESPACE` | Namespace for K8s mode | - | When running server inside a Kubernetes pod |
+| `K8S_NAMESPACE` | Alternative namespace variable | - | Alternative to `KUBERNETES_NAMESPACE` |
+| `PROMETHEUS_URL` | Prometheus server URL for metrics | Auto-detected | Custom Prometheus endpoint or non-standard port |
+| `KUBECONFIG` | Path to kubeconfig file | `~/.kube/config` | Multiple clusters or custom kubeconfig location |
+| `LOG_LEVEL` | Logging verbosity (DEBUG, INFO, WARNING, ERROR) | `INFO` | Debugging issues or reducing log noise |
+| `MCP_SERVER_LOG_LEVEL` | MCP framework log level | `INFO` | Troubleshooting MCP protocol issues |
+| `PYTHONUNBUFFERED` | Disable Python output buffering | - | Recommended for MCP clients to see real-time logs |
 
 ## Available Tools
 
@@ -200,7 +444,7 @@ The server automatically detects Kubernetes configuration:
 | `conservative_namespace_overview` | Focused namespace health check |
 | `adaptive_namespace_investigation` | Dynamic investigation based on query |
 
-### Certificate & Security (3 tools)
+### Certificate & Security (2 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -252,6 +496,74 @@ lumino-mcp-server/
 │       └── utils.py             # Utility functions
 └── pyproject.toml          # Project configuration
 ```
+
+## How It Works
+
+LUMINO acts as a bridge between AI assistants and your Kubernetes infrastructure through the Model Context Protocol:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        AI Assistant Layer                        │
+│          (Claude Desktop, Claude Code CLI, Gemini CLI)          │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             │ Natural Language Queries
+                             │ "Analyze failed pipelines"
+                             │ "Predict resource bottlenecks"
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Model Context Protocol                       │
+│                      (MCP Communication)                         │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             │ Tool Invocations & Results
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       LUMINO MCP Server                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
+│  │ Log Analysis │  │ Event Intel  │  │  Predictive  │         │
+│  │   (6 tools)  │  │  (3 tools)   │  │  (2 tools)   │         │
+│  └──────────────┘  └──────────────┘  └──────────────┘         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
+│  │   Pipeline   │  │  Simulation  │  │   Topology   │         │
+│  │  (6 tools)   │  │  (1 tool)    │  │  (2 tools)   │         │
+│  └──────────────┘  └──────────────┘  └──────────────┘         │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             │ Kubernetes API Calls
+                             │ Prometheus Queries
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Kubernetes/OpenShift Cluster                  │
+│                                                                   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │   Pods   │  │ Services │  │ Tekton   │  │etcd/Logs │       │
+│  └──────────┘  └──────────┘  │Pipelines │  └──────────┘       │
+│  ┌──────────┐  ┌──────────┐  └──────────┘  ┌──────────┐       │
+│  │  Events  │  │ Configs  │  ┌──────────┐  │Prometheus│       │
+│  └──────────┘  └──────────┘  │OpenShift │  └──────────┘       │
+│                               │Operators │                       │
+│                               └──────────┘                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Workflow
+
+1. **User Query** → AI assistant receives natural language request
+2. **MCP Translation** → Assistant converts query to appropriate tool calls
+3. **LUMINO Processing** → Server executes Kubernetes/Prometheus operations
+4. **Data Analysis** → ML/statistical algorithms process raw data
+5. **AI Synthesis** → Assistant formats results into human-readable insights
+
+### Key Features
+
+- **Stateless Design** - No data persistence, queries cluster in real-time
+- **Automatic Transport Detection** - Switches between stdio (local) and HTTP (K8s) modes
+- **Token Budget Management** - Adaptive strategies to handle large log volumes
+- **Intelligent Caching** - Smart caching for frequently accessed data
+- **Security First** - Uses existing kubeconfig RBAC permissions, no separate auth
 
 ## MCP Client Integration
 
@@ -359,9 +671,19 @@ If you prefer manual setup or need to configure Claude Desktop / Cursor, follow 
 
 #### Claude Code CLI
 
-**Option A: Using MCPM** (Recommended - see Method 1 above)
+**Option A: Using MCPM** (see Method 1 above)
 
-**Option B: Manual Configuration**
+**Option B: Automatic Provisioning via Claude Code** (Recommended and easiest way)
+
+Simply ask Claude Code to set up the server for you:
+
+```
+Provision the Lumino MCP server from https://github.com/spre-sre/lumino-mcp-server as an MCP integration for this Claude Code project
+```
+
+Claude will automatically clone, configure, and integrate the server into your project.
+
+**Option C: Manual Configuration**
 
 1. **Find your config file location**:
    - macOS/Linux: `~/.config/claude/mcp_servers.json`
@@ -602,7 +924,7 @@ uv run python main.py
 Expected output:
 ```
 MCP Server running in stdio mode
-Available tools: 38
+Available tools: 37
 Waiting for requests...
 ```
 
@@ -654,6 +976,93 @@ The server automatically detects the appropriate transport:
 
 - **stdio** - For local desktop integrations (Claude Desktop, Claude Code CLI, Gemini CLI, Cursor)
 - **streamable-http** - For Kubernetes deployments (when `KUBERNETES_NAMESPACE` is set)
+
+## Performance Considerations
+
+### Optimizing for Large Clusters
+
+LUMINO is designed to handle clusters of any size efficiently:
+
+| Cluster Size | Recommendation | Tool Strategy |
+|--------------|----------------|---------------|
+| **Small** (< 50 pods) | Use default settings | All tools work optimally |
+| **Medium** (50-500 pods) | Use namespace filtering | Leverage adaptive tools with auto-sampling |
+| **Large** (500+ pods) | Specify time windows and namespaces | Use conservative and streaming tools |
+| **Very Large** (1000+ pods) | Combine filters and pagination | Progressive analysis with targeted queries |
+
+### Token Budget Management
+
+LUMINO automatically manages AI context limits:
+
+- **Adaptive Sampling** - Smart tools auto-sample data when volumes are high
+- **Progressive Loading** - Stream analysis processes data in chunks
+- **Token Budgets** - Configurable limits prevent context overflow
+- **Hybrid Strategies** - Automatically selects best analysis approach
+
+### Query Optimization Tips
+
+**Use Namespace Filtering**
+```
+✅ "Analyze logs for pods in namespace production"
+❌ "Analyze all pod logs in the cluster"
+```
+
+**Specify Time Windows**
+```
+✅ "Show events from the last 2 hours"
+❌ "Show all events" (might return thousands)
+```
+
+**Leverage Smart Tools**
+```
+✅ "smart_summarize_pod_logs" - Adaptive analysis
+❌ Direct log dumps - No processing
+```
+
+**Use Progressive Analysis**
+```
+✅ Start with "overview" → drill down to "detailed"
+❌ Jump directly to "deep_dive" on large datasets
+```
+
+### Performance Metrics
+
+| Operation | Typical Response Time | Scalability |
+|-----------|----------------------|-------------|
+| List namespaces | < 1s | O(1) |
+| Get pod logs (1 pod) | 1-3s | O(log size) |
+| Analyze pipeline run | 2-5s | O(task count) |
+| Cluster-wide search | 5-15s | O(namespace count) |
+| ML anomaly detection | 3-10s | O(data points) |
+| Topology mapping | 5-20s | O(resource count) |
+
+### Caching Strategy
+
+LUMINO uses intelligent caching for frequently accessed data:
+
+- **15-minute cache** - For web-fetched content
+- **Session cache** - For hybrid log analysis
+- **No persistence** - All data queries cluster in real-time
+
+### Concurrent Requests
+
+The server handles multiple concurrent requests efficiently:
+
+- **Thread-safe operations** - Safe parallel tool execution
+- **Connection pooling** - Reuses Kubernetes API connections
+- **Async HTTP** - Non-blocking Prometheus queries
+
+### Resource Usage
+
+**Server Resource Requirements**
+
+| Deployment | CPU | Memory | Disk |
+|------------|-----|--------|------|
+| Local (stdio) | 100-500m | 256-512Mi | Minimal |
+| Kubernetes | 200m-1 | 512Mi-1Gi | Minimal |
+| High-load | 1-2 | 1-2Gi | Minimal |
+
+**Note**: LUMINO is stateless and requires minimal resources. Most processing happens in the AI assistant.
 
 ## Troubleshooting
 
