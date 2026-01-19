@@ -1027,7 +1027,21 @@ def determine_root_cause(analysis_results: Dict[str, Any]) -> str:
         category = most_common[0]
 
         # Map category to more specific root causes
-        if category == "resource_limits":
+        # Kubernetes-specific categories
+        if category == "oom":
+            return "Out of Memory (OOMKilled) - container exceeded memory limits and was killed"
+        elif category == "crash":
+            return "Container crash loop (CrashLoopBackOff) - container is repeatedly crashing on startup"
+        elif category == "image":
+            return "Image pull failure (ImagePullBackOff) - unable to pull container image from registry"
+        elif category == "scheduling":
+            return "Pod scheduling failure - insufficient resources or node constraints preventing scheduling"
+        elif category == "storage":
+            return "Storage/volume issues - failed to mount volume or PVC problems"
+        elif category == "config":
+            return "Container configuration error - missing ConfigMap, Secret, or environment variable"
+        # General categories
+        elif category == "resource_limits":
             return "Resource constraint issues - the pipeline is likely hitting memory or CPU limits"
         elif category == "network":
             return "Network connectivity issues - check network policies and external dependencies"
@@ -1059,44 +1073,94 @@ def recommend_actions(analysis_results: Dict[str, Any]) -> List[str]:
     recommendations = []
 
     # Based on root cause, suggest appropriate actions
-    root_cause = analysis_results.get("probable_root_cause", "")
+    root_cause = analysis_results.get("probable_root_cause", "").lower()
 
-    if "resource constraint" in root_cause.lower():
+    # Kubernetes-specific root causes
+    if "oomkilled" in root_cause or "out of memory" in root_cause:
+        recommendations.extend([
+            "Increase memory limits for the affected container/task",
+            "Check if the build process has memory leaks",
+            "Consider splitting large tasks into smaller steps",
+            "Review memory requests vs limits ratio",
+            "Monitor memory usage during pipeline execution"
+        ])
+    elif "crashloopbackoff" in root_cause or "crash loop" in root_cause:
+        recommendations.extend([
+            "Check container logs for crash reason before restart",
+            "Verify container entrypoint and command are correct",
+            "Check if required dependencies are available at startup",
+            "Review liveness/readiness probe configurations",
+            "Check for race conditions in container initialization"
+        ])
+    elif "imagepullbackoff" in root_cause or "image pull" in root_cause:
+        recommendations.extend([
+            "Verify the container image exists in the registry",
+            "Check image pull secrets are configured correctly",
+            "Verify registry credentials are valid and not expired",
+            "Check network access to the container registry",
+            "Verify image tag is correct and available"
+        ])
+    elif "scheduling" in root_cause:
+        recommendations.extend([
+            "Check node resources - ensure sufficient CPU/memory available",
+            "Review node selectors and affinity rules",
+            "Check for taints on nodes that may prevent scheduling",
+            "Verify resource quotas in the namespace",
+            "Check if required node labels exist"
+        ])
+    elif "storage" in root_cause or "volume" in root_cause:
+        recommendations.extend([
+            "Check PVC status and bound PV availability",
+            "Verify storage class exists and is default or specified",
+            "Check if the storage provisioner is healthy",
+            "Review volume mount paths for conflicts",
+            "Check storage quota limits in the namespace"
+        ])
+    elif "container configuration" in root_cause:
+        recommendations.extend([
+            "Verify referenced ConfigMaps exist and have required keys",
+            "Check Secrets are available and properly referenced",
+            "Review environment variable definitions",
+            "Check volume mounts for ConfigMaps/Secrets",
+            "Verify container security context settings"
+        ])
+    # General categories
+    elif "resource constraint" in root_cause:
         recommendations.extend([
             "Check resource quotas and limits in the namespace",
             "Consider increasing CPU/memory limits for affected pods",
             "Review resource requests/limits in PipelineRun and TaskRun specs",
             "Monitor cluster resource utilization during pipeline runs"
         ])
-    elif "network" in root_cause.lower():
+    elif "network" in root_cause:
         recommendations.extend([
             "Verify network policies allow necessary connections",
             "Check external dependencies are accessible from the cluster",
             "Review DNS configuration in the cluster",
             "Check for timeouts in build configurations"
         ])
-    elif "permission" in root_cause.lower() or "authorization" in root_cause.lower():
+    elif "permission" in root_cause or "authorization" in root_cause:
         recommendations.extend([
             "Review RBAC permissions for service accounts used by Tekton pipelines",
             "Check if appropriate ClusterRoles and RoleBindings are in place",
             "Verify service account tokens are mounted correctly",
             "Check for recent changes to RBAC policies"
         ])
-    elif "configuration" in root_cause.lower():
+    elif "configuration" in root_cause:
         recommendations.extend([
             "Check ConfigMaps and Secrets referenced by pipelines",
             "Verify pipeline parameters are correctly specified",
             "Review task definitions for correctness",
             "Check CI/CD pipeline configuration for inconsistencies"
         ])
-    elif "dependency" in root_cause.lower():
+    elif "dependency" in root_cause:
         recommendations.extend([
             "Check image versions in TaskRuns and PipelineRuns",
             "Verify external dependencies are available",
             "Update task definitions if using deprecated features",
             "Check for version mismatches between components"
         ])
-    elif "filesystem" in root_cause.lower():
+    elif "filesystem" in root_cause:
         recommendations.extend([
             "Check persistent volume claims and storage classes",
             "Verify file paths in task specifications",
@@ -1157,16 +1221,47 @@ async def get_pipeline_details(
         )
 
         # Extract basic information
+        metadata = pipeline_run_obj.get("metadata", {})
+        spec = pipeline_run_obj.get("spec", {})
         status = pipeline_run_obj.get("status", {})
         conditions = status.get("conditions", [])
         condition = conditions[0] if conditions else {}
+
+        # Get pipeline name from multiple sources (same logic as list_pipelineruns)
+        # Priority: pipelineRef.name > labels > pipelineSpec metadata > unknown
+        pipeline_name = "unknown"
+
+        # 1. Check spec.pipelineRef.name (direct reference to named Pipeline)
+        pipeline_ref = spec.get("pipelineRef", {})
+        if pipeline_ref and pipeline_ref.get("name"):
+            pipeline_name = pipeline_ref.get("name")
+
+        # 2. Check common Tekton labels (used by Konflux and other platforms)
+        if pipeline_name == "unknown":
+            labels = metadata.get("labels", {})
+            pipeline_name = (
+                labels.get("tekton.dev/pipeline") or
+                labels.get("pipelines.tekton.dev/pipeline") or
+                labels.get("pipelines.openshift.io/pipeline") or
+                "unknown"
+            )
+
+        # 3. Check inline pipelineSpec for name/displayName
+        if pipeline_name == "unknown":
+            pipeline_spec = spec.get("pipelineSpec", {})
+            if pipeline_spec:
+                pipeline_name = (
+                    pipeline_spec.get("displayName") or
+                    pipeline_spec.get("name") or
+                    "unknown"
+                )
 
         # Get all task runs for this pipeline
         task_runs = await list_taskruns_func(namespace, pipeline_run)
 
         result = {
             "name": pipeline_run,
-            "pipeline": pipeline_run_obj.get("spec", {}).get("pipelineRef", {}).get("name", "unknown"),
+            "pipeline": pipeline_name,
             "status": condition.get("reason", "Unknown"),
             "message": condition.get("message", ""),
             "started_at": status.get("startTime", "unknown"),
