@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-1.10%2B-green.svg)](https://modelcontextprotocol.io/)
 
-An open source MCP (Model Context Protocol) server providing AI-powered tools for Kubernetes, OpenShift, and Tekton monitoring, analysis, and troubleshooting.
+An open source MCP (Model Context Protocol) server empowering SREs with intelligent observability, predictive analytics, and AI-driven automation across Kubernetes, OpenShift, and Tekton environments.
 
 ## Table of Contents
 
