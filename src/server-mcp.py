@@ -3608,10 +3608,13 @@ async def search_resources_by_labels(
                                     limit=limit_per_type
                                 )
 
-                            if hasattr(response, 'items'):
+                            # Custom objects return dicts, native K8s objects have items attribute
+                            if isinstance(response, dict):
+                                items = response.get('items', [])
+                            elif hasattr(response, 'items'):
                                 items = response.items
                             else:
-                                items = response.get('items', [])
+                                items = []
 
                             for item in items:
                                 if hasattr(item, 'to_dict'):
@@ -3653,10 +3656,13 @@ async def search_resources_by_labels(
                                 limit=limit_per_type
                             )
 
-                        if hasattr(response, 'items'):
+                        # Custom objects return dicts, native K8s objects have items attribute
+                        if isinstance(response, dict):
+                            items = response.get('items', [])
+                        elif hasattr(response, 'items'):
                             items = response.items
                         else:
-                            items = response.get('items', [])
+                            items = []
 
                         for item in items:
                             if hasattr(item, 'to_dict'):

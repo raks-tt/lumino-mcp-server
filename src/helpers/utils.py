@@ -1343,10 +1343,10 @@ def get_resource_api_info(resource_type: str) -> Optional[Dict[str, Any]]:
         "clustertasks": {"api": "custom", "group": "tekton.dev", "version": "v1", "plural": "clustertasks", "namespaced": False},
 
         # Tekton Triggers resources
-        "triggers": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1alpha1", "plural": "triggers", "namespaced": True},
-        "triggerbindings": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1alpha1", "plural": "triggerbindings", "namespaced": True},
-        "triggertemplates": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1alpha1", "plural": "triggertemplates", "namespaced": True},
-        "eventlisteners": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1alpha1", "plural": "eventlisteners", "namespaced": True},
+        "triggers": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1beta1", "plural": "triggers", "namespaced": True},
+        "triggerbindings": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1beta1", "plural": "triggerbindings", "namespaced": True},
+        "triggertemplates": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1beta1", "plural": "triggertemplates", "namespaced": True},
+        "eventlisteners": {"api": "custom", "group": "triggers.tekton.dev", "version": "v1beta1", "plural": "eventlisteners", "namespaced": True},
     }
 
     return resource_map.get(resource_type.lower(), None)
