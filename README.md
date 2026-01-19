@@ -85,13 +85,27 @@ Get started with LUMINO in under 2 minutes:
 
 ### For Claude Code CLI Users (Easiest)
 
-Simply ask Claude Code:
-
+```bash
+Install the Lumino MCP server as a project-local MCP server:
+    1. Clone https://github.com/spre-sre/lumino-mcp-server into ./lumino-mcp-server
+    2. Install Python dependencies: cd lumino-mcp-server && uv sync
+    3. Create .mcp.json in the current project root (not inside lumino-mcp-server) with:
+        {
+       "mcpServers": {
+         "lumino": {
+           "type": "stdio",
+           "command": "uv",
+           "args": ["run", "python", "main.py"],
+           "cwd": "./lumino-mcp-server"
+         }
+       }
+     }
+    4. After setup, inform the user:
+       - Exit Claude Code
+       - Connect to your Kubernetes or OpenShift cluster (kubectl/oc login)
+       - Restart Claude Code - you will see a prompt to approve the Lumino MCP server
+       - Once approved, Lumino tools will be available in the MCP server menu
 ```
-Provision the Lumino MCP server from https://github.com/spre-sre/lumino-mcp-server as an MCP integration for this Claude Code project
-```
-
-Claude will automatically clone, configure, and integrate the server into your project.
 
 ### For Other MCP Clients
 
