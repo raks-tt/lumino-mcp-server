@@ -849,23 +849,36 @@ def detect_anomalies_in_data(data_points: List[float], original_data: List[Any])
 
 def extract_error_patterns(log_text: str) -> List[str]:
     """
-    Extract common error patterns from log text.
+    Extract common error patterns from log text including Kubernetes-specific errors.
 
     Args:
         log_text: Raw log content to analyze
 
     Returns:
-        List of error lines found in the logs (max 10)
+        List of error lines found in the logs (max 15)
     """
     if not log_text or log_text == "No pod logs available":
         return []
 
-    # Common error patterns to look for
+    # Common error patterns to look for (case-insensitive)
     patterns = [
+        # General error indicators
         "Error:", "Exception:", "Failed:", "fatal:", "panic:",
         "cannot", "unable to", "failed to", "error", "invalid",
         "No such file", "Permission denied", "Out of memory",
-        "Connection refused", "timed out"
+        "Connection refused", "timed out",
+        # Kubernetes-specific errors
+        "OOMKilled", "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull",
+        "CreateContainerConfigError", "CreateContainerError",
+        "FailedMount", "FailedAttachVolume", "FailedScheduling",
+        "Unschedulable", "BackOff", "Evicted",
+        # Container runtime errors
+        "container killed", "container exited", "restart count",
+        "liveness probe failed", "readiness probe failed",
+        # Network errors
+        "dial tcp", "no route to host", "connection reset",
+        # Resource errors
+        "quota exceeded", "limit exceeded", "insufficient"
     ]
 
     # Find lines containing these patterns
@@ -879,12 +892,12 @@ def extract_error_patterns(log_text: str) -> List[str]:
             error_lines.append(line)
 
     # Return a limited number of most relevant error lines
-    return error_lines[:10]
+    return error_lines[:15]
 
 
 def categorize_errors(log_text: str, error_patterns: List[str]) -> Dict[str, int]:
     """
-    Categorize errors into common types.
+    Categorize errors into common types including Kubernetes-specific errors.
 
     Args:
         log_text: Raw log content
@@ -894,12 +907,20 @@ def categorize_errors(log_text: str, error_patterns: List[str]) -> Dict[str, int
         Dictionary mapping error categories to occurrence counts
     """
     categories = {
-        "resource_limits": ["out of memory", "memory limit", "cpu limit", "resource limit"],
-        "network": ["timeout", "connection refused", "connection reset", "network", "dns lookup"],
-        "permissions": ["access denied", "permission", "forbidden", "unauthorized"],
-        "configuration": ["config", "invalid configuration", "missing parameter"],
-        "dependency": ["not found", "missing dependency", "version mismatch"],
-        "filesystem": ["no such file", "directory not found", "file not found"]
+        # Kubernetes-specific categories
+        "oom": ["oomkilled", "oom killed", "out of memory", "memory limit exceeded", "exceeded memory"],
+        "crash": ["crashloopbackoff", "crash loop", "container crashed", "backoff restarting"],
+        "image": ["imagepullbackoff", "errimagepull", "image pull", "pull image", "registry"],
+        "scheduling": ["unschedulable", "failedscheduling", "insufficient", "node affinity"],
+        "storage": ["failedmount", "volume mount", "pvc", "persistent volume", "mount failed"],
+        "config": ["createcontainerconfigerror", "configmap", "secret not found", "missing key", "invalid config"],
+        # General categories
+        "resource_limits": ["memory limit", "cpu limit", "resource limit", "resource quota", "evicted"],
+        "network": ["timeout", "connection refused", "connection reset", "unreachable", "dns lookup", "dial tcp"],
+        "permissions": ["access denied", "permission denied", "forbidden", "unauthorized", "rbac"],
+        "configuration": ["invalid configuration", "missing parameter", "environment variable"],
+        "dependency": ["not found", "missing dependency", "version mismatch", "incompatible"],
+        "filesystem": ["no such file", "directory not found", "file not found", "read-only filesystem"]
     }
 
     counts = {category: 0 for category in categories.keys()}
