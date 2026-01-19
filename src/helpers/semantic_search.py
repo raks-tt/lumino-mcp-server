@@ -472,7 +472,14 @@ def identify_common_patterns(ranked_results: List[Dict[str, Any]]) -> List[str]:
     # Analyze log levels
     level_counts = defaultdict(int)
     for result in ranked_results:
-        level = result.get('log_level', 'unknown')
+        # Check nested log_entry.level first, then top-level log_level
+        log_entry = result.get('log_entry', {})
+        level = log_entry.get('level') if isinstance(log_entry, dict) else None
+        if not level:
+            level = result.get('log_level', 'unknown')
+        # Normalize level names
+        if level == 'warning':
+            level = 'warn'
         level_counts[level] += 1
 
     total_results = len(ranked_results)
@@ -483,7 +490,12 @@ def identify_common_patterns(ranked_results: List[Dict[str, Any]]) -> List[str]:
     # Analyze content patterns
     content_words = []
     for result in ranked_results:
-        content = result.get('content', '').lower()
+        # Check nested log_entry.message first, then top-level content
+        log_entry = result.get('log_entry', {})
+        content = log_entry.get('message', '') if isinstance(log_entry, dict) else ''
+        if not content:
+            content = result.get('content', '')
+        content = content.lower()
         # Extract meaningful words (excluding common words)
         words = [word for word in content.split()
                 if len(word) > 3 and word not in ['the', 'and', 'for', 'with', 'from']]
@@ -501,8 +513,15 @@ def identify_common_patterns(ranked_results: List[Dict[str, Any]]) -> List[str]:
         patterns.append(f"Common terms: {', '.join(frequent_words[:5])}")
 
     # Analyze temporal patterns
-    timestamps = [result.get('timestamp', '') for result in ranked_results
-                 if result.get('timestamp') != 'unknown']
+    timestamps = []
+    for result in ranked_results:
+        # Check nested log_entry.timestamp first, then top-level timestamp
+        log_entry = result.get('log_entry', {})
+        ts = log_entry.get('timestamp') if isinstance(log_entry, dict) else None
+        if not ts or ts == 'unknown':
+            ts = result.get('timestamp', '')
+        if ts and ts != 'unknown':
+            timestamps.append(ts)
 
     if len(timestamps) > 5:
         patterns.append(f"Temporal distribution: {len(timestamps)} timestamped entries")
@@ -515,7 +534,16 @@ def analyze_severity_distribution(ranked_results: List[Dict[str, Any]]) -> Dict[
     severity_counts = {'error': 0, 'warn': 0, 'info': 0, 'debug': 0, 'unknown': 0}
 
     for result in ranked_results:
-        level = result.get('log_level', 'unknown')
+        # Check nested log_entry.level first, then top-level log_level for backwards compatibility
+        log_entry = result.get('log_entry', {})
+        level = log_entry.get('level') if isinstance(log_entry, dict) else None
+        if not level:
+            level = result.get('log_level', 'unknown')
+
+        # Normalize level names (warn/warning -> warn)
+        if level == 'warning':
+            level = 'warn'
+
         if level in severity_counts:
             severity_counts[level] += 1
         else:
