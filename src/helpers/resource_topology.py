@@ -793,22 +793,40 @@ async def get_resource_metrics(cluster_name: str, resource_type: str, namespace:
         return {}
 
 
-async def analyze_owner_references(resource: Dict[str, Any], cluster: str) -> List[Dict[str, str]]:
-    """Analyze Kubernetes OwnerReferences to find parent-child relationships."""
+async def analyze_owner_references(resource: Dict[str, Any], cluster: str, resource_type: str) -> List[Dict[str, str]]:
+    """Analyze Kubernetes OwnerReferences to find parent-child relationships.
+
+    Args:
+        resource: Resource dict from Kubernetes API
+        cluster: Cluster name
+        resource_type: The type of the resource (e.g., 'pod', 'deployment', 'replicaset')
+                      Required because .to_dict() doesn't include 'kind' field.
+    """
     edges = []
-    owner_refs = resource.get("metadata", {}).get("ownerReferences", [])
+    owner_refs = resource.get("metadata", {}).get("owner_references", [])
+
+    # Also check camelCase version (raw API response vs client model)
+    if not owner_refs:
+        owner_refs = resource.get("metadata", {}).get("ownerReferences", [])
 
     for owner in owner_refs:
+        owner_kind = owner.get("kind", "").lower()
+        owner_name = owner.get("name", "")
+
+        # Skip if owner info is missing
+        if not owner_kind or not owner_name:
+            continue
+
         source_id = generate_node_id(
             cluster,
             resource.get("metadata", {}).get("namespace", "default"),
-            owner.get("kind", "").lower(),
-            owner.get("name", "")
+            owner_kind,
+            owner_name
         )
         target_id = generate_node_id(
             cluster,
             resource.get("metadata", {}).get("namespace", "default"),
-            resource.get("kind", "").lower(),
+            resource_type,
             resource.get("metadata", {}).get("name", "")
         )
 
@@ -816,15 +834,23 @@ async def analyze_owner_references(resource: Dict[str, Any], cluster: str) -> Li
             "source": source_id,
             "target": target_id,
             "relationship": "owns",
-            "weight": calculate_dependency_weight(owner.get("kind", "").lower(),
-                                                 resource.get("kind", "").lower(), "owns")
+            "weight": calculate_dependency_weight(owner_kind, resource_type, "owns")
         })
 
     return edges
 
 
-async def analyze_service_dependencies(service: Dict[str, Any], cluster: str, core_api, logger) -> List[Dict[str, str]]:
-    """Analyze service selector relationships to pods."""
+async def analyze_service_dependencies(service: Dict[str, Any], cluster: str, core_api, logger, pods_list=None) -> List[Dict[str, str]]:
+    """Analyze service selector relationships to pods.
+
+    Args:
+        service: Service resource dict
+        cluster: Cluster name
+        core_api: Kubernetes CoreV1Api client
+        logger: Logger instance
+        pods_list: Optional pre-fetched list of pods to avoid N+1 queries.
+                   If None, will fetch pods from API (legacy behavior).
+    """
     edges = []
     try:
         selector = service.get("spec", {}).get("selector", {})
@@ -833,10 +859,15 @@ async def analyze_service_dependencies(service: Dict[str, Any], cluster: str, co
         if not selector:
             return edges
 
-        # Find pods matching the selector
-        pods = core_api.list_namespaced_pod(namespace=namespace)
+        # Use pre-fetched pods if available, otherwise fetch (legacy fallback)
+        if pods_list is not None:
+            pods_items = pods_list
+        else:
+            import asyncio
+            pods = await asyncio.to_thread(core_api.list_namespaced_pod, namespace=namespace)
+            pods_items = pods.items
 
-        for pod in pods.items:
+        for pod in pods_items:
             pod_labels = pod.metadata.labels or {}
 
             # Check if all selector labels match pod labels
@@ -858,52 +889,99 @@ async def analyze_service_dependencies(service: Dict[str, Any], cluster: str, co
     return edges
 
 
-async def analyze_volume_dependencies(resource: Dict[str, Any], cluster: str, logger) -> List[Dict[str, str]]:
-    """Analyze volume mount dependencies."""
+async def analyze_volume_dependencies(resource: Dict[str, Any], cluster: str, resource_type: str, logger) -> List[Dict[str, str]]:
+    """Analyze volume mount dependencies.
+
+    Args:
+        resource: Resource dict from Kubernetes API
+        cluster: Cluster name
+        resource_type: The type of the resource (e.g., 'pod', 'deployment')
+                      Required because .to_dict() doesn't include 'kind' field.
+        logger: Logger instance
+    """
     edges = []
     try:
         spec = resource.get("spec", {})
         namespace = resource.get("metadata", {}).get("namespace", "default")
         resource_name = resource.get("metadata", {}).get("name", "")
-        resource_type = resource.get("kind", "").lower()
 
+        # Get volumes - handle different resource types
+        # For Pods: spec.volumes
+        # For Deployments/StatefulSets/etc: spec.template.spec.volumes
         volumes = spec.get("volumes", [])
+        if not volumes and "template" in spec:
+            template_spec = spec.get("template", {}).get("spec", {})
+            volumes = template_spec.get("volumes", [])
 
         for volume in volumes:
             source_id = generate_node_id(cluster, namespace, resource_type, resource_name)
+            volume_name = volume.get("name", "")
 
-            # Check for PVC references
-            if "persistentVolumeClaim" in volume:
-                pvc_name = volume["persistentVolumeClaim"]["claimName"]
-                target_id = generate_node_id(cluster, namespace, "persistentvolumeclaim", pvc_name)
-                edges.append({
-                    "source": source_id,
-                    "target": target_id,
-                    "relationship": "mounts",
-                    "weight": calculate_dependency_weight(resource_type, "persistentvolumeclaim", "mounts")
-                })
+            # Check for PVC references (handle both camelCase and snake_case)
+            pvc_ref = volume.get("persistentVolumeClaim") or volume.get("persistent_volume_claim")
+            if pvc_ref:
+                pvc_name = pvc_ref.get("claimName") or pvc_ref.get("claim_name", "")
+                if pvc_name:
+                    target_id = generate_node_id(cluster, namespace, "persistentvolumeclaim", pvc_name)
+                    edges.append({
+                        "source": source_id,
+                        "target": target_id,
+                        "relationship": "mounts",
+                        "weight": calculate_dependency_weight(resource_type, "persistentvolumeclaim", "mounts")
+                    })
 
-            # Check for ConfigMap references
-            if "configMap" in volume:
-                cm_name = volume["configMap"]["name"]
-                target_id = generate_node_id(cluster, namespace, "configmap", cm_name)
-                edges.append({
-                    "source": source_id,
-                    "target": target_id,
-                    "relationship": "mounts",
-                    "weight": calculate_dependency_weight(resource_type, "configmap", "mounts")
-                })
+            # Check for ConfigMap references (handle both camelCase and snake_case)
+            cm_ref = volume.get("configMap") or volume.get("config_map")
+            if cm_ref:
+                cm_name = cm_ref.get("name", "")
+                if cm_name:
+                    target_id = generate_node_id(cluster, namespace, "configmap", cm_name)
+                    edges.append({
+                        "source": source_id,
+                        "target": target_id,
+                        "relationship": "mounts",
+                        "weight": calculate_dependency_weight(resource_type, "configmap", "mounts")
+                    })
 
             # Check for Secret references
-            if "secret" in volume:
-                secret_name = volume["secret"]["secretName"]
-                target_id = generate_node_id(cluster, namespace, "secret", secret_name)
-                edges.append({
-                    "source": source_id,
-                    "target": target_id,
-                    "relationship": "mounts",
-                    "weight": calculate_dependency_weight(resource_type, "secret", "mounts")
-                })
+            secret_ref = volume.get("secret")
+            if secret_ref:
+                secret_name = secret_ref.get("secretName") or secret_ref.get("secret_name", "")
+                if secret_name:
+                    target_id = generate_node_id(cluster, namespace, "secret", secret_name)
+                    edges.append({
+                        "source": source_id,
+                        "target": target_id,
+                        "relationship": "mounts",
+                        "weight": calculate_dependency_weight(resource_type, "secret", "mounts")
+                    })
+
+            # Check for projected volumes (can include ConfigMaps and Secrets)
+            projected = volume.get("projected")
+            if projected:
+                for source in projected.get("sources", []):
+                    if "configMap" in source or "config_map" in source:
+                        cm_src = source.get("configMap") or source.get("config_map", {})
+                        cm_name = cm_src.get("name", "")
+                        if cm_name:
+                            target_id = generate_node_id(cluster, namespace, "configmap", cm_name)
+                            edges.append({
+                                "source": source_id,
+                                "target": target_id,
+                                "relationship": "mounts",
+                                "weight": calculate_dependency_weight(resource_type, "configmap", "mounts")
+                            })
+                    if "secret" in source:
+                        secret_src = source.get("secret", {})
+                        secret_name = secret_src.get("name", "")
+                        if secret_name:
+                            target_id = generate_node_id(cluster, namespace, "secret", secret_name)
+                            edges.append({
+                                "source": source_id,
+                                "target": target_id,
+                                "relationship": "mounts",
+                                "weight": calculate_dependency_weight(resource_type, "secret", "mounts")
+                            })
 
     except Exception as e:
         logger.debug(f"Error analyzing volume dependencies: {e}")
@@ -914,6 +992,49 @@ async def analyze_volume_dependencies(resource: Dict[str, Any], cluster: str, lo
 # ============================================================================
 # SIMULATION AFFECTED COMPONENTS ANALYSIS
 # ============================================================================
+
+
+# ============================================================================
+# PERMISSION-AWARE RESOURCE FETCHING
+# ============================================================================
+
+def handle_resource_fetch_error(e: Exception, resource_type: str, namespace: str,
+                                skip_on_permission_denied: bool, logger) -> Dict[str, Any]:
+    """
+    Handle errors during resource fetching with permission-aware logic.
+
+    Returns:
+        Dict with 'success', 'permission_denied', 'error_message' keys
+    """
+    from kubernetes.client.rest import ApiException
+
+    result = {
+        "success": False,
+        "permission_denied": False,
+        "error_message": str(e)
+    }
+
+    if isinstance(e, ApiException):
+        if e.status == 403:
+            # Permission denied
+            result["permission_denied"] = True
+            logger.info(f"Permission denied for {resource_type} in namespace {namespace} (403 Forbidden)")
+
+            if skip_on_permission_denied:
+                logger.debug(f"Skipping {resource_type} due to permission denied (skip_on_permission_denied=True)")
+            else:
+                logger.warning(f"Permission denied for {resource_type} in namespace {namespace}")
+        elif e.status == 404:
+            # Resource type not found (e.g., Tekton not installed)
+            logger.debug(f"Resource type {resource_type} not found in namespace {namespace} (404)")
+        else:
+            # Other API error
+            logger.warning(f"API error fetching {resource_type} in namespace {namespace}: {e.status} - {e.reason}")
+    else:
+        # Non-API exception
+        logger.error(f"Unexpected error fetching {resource_type} in namespace {namespace}: {e}")
+
+    return result
 
 
 async def identify_affected_components(
@@ -1016,3 +1137,53 @@ async def identify_affected_components(
     except Exception as e:
         logger.error(f"Error identifying affected components: {e}")
         return [{"component": "unknown", "impact_type": "error", "severity": "unknown", "details": str(e)}]
+
+
+# ============================================================================
+# TOPOLOGY OUTPUT FORMAT CONVERTERS
+# ============================================================================
+
+def convert_to_graphviz(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]) -> str:
+    """Convert topology to Graphviz DOT format."""
+    dot = ["digraph topology {"]
+    dot.append("  rankdir=LR;")
+    dot.append("  node [shape=box];")
+
+    # Add nodes with labels
+    for node in nodes:
+        node_type = node.get("type", "unknown")
+        name = node.get("name", "unknown")
+        namespace = node.get("namespace", "default")
+        label = f"{namespace}\\n{name}\\n({node_type})"
+        dot.append(f'  "{node["id"]}" [label="{label}"];')
+
+    # Add edges
+    for edge in edges:
+        relationship = edge.get("relationship", "")
+        dot.append(f'  "{edge["source"]}" -> "{edge["target"]}" [label="{relationship}"];')
+
+    dot.append("}")
+    return "\n".join(dot)
+
+
+def convert_to_mermaid(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]) -> str:
+    """Convert topology to Mermaid diagram format."""
+    mermaid = ["graph LR"]
+
+    # Add nodes
+    for node in nodes:
+        node_type = node.get("type", "unknown")
+        name = node.get("name", "unknown")
+        label = f"{name}<br/>({node_type})"
+        # Sanitize node ID for mermaid
+        node_id = node["id"].replace(":", "_").replace("/", "_")
+        mermaid.append(f'  {node_id}["{label}"]')
+
+    # Add edges
+    for edge in edges:
+        source_id = edge["source"].replace(":", "_").replace("/", "_")
+        target_id = edge["target"].replace(":", "_").replace("/", "_")
+        relationship = edge.get("relationship", "")
+        mermaid.append(f'  {source_id} -->|{relationship}| {target_id}')
+
+    return "\n".join(mermaid)

@@ -35,9 +35,6 @@ from .utils import (
     categorize_certificate_status,
     # Performance analysis helpers
     detect_performance_trend,
-    # Topology graph conversion helpers
-    convert_to_graphviz,
-    convert_to_mermaid,
     # Resource forecasting helpers
     calculate_forecast_intervals,
     simple_linear_forecast,
@@ -217,6 +214,11 @@ from .resource_topology import (
     analyze_owner_references,
     analyze_service_dependencies,
     analyze_volume_dependencies,
+    # Permission-aware resource fetching
+    handle_resource_fetch_error,
+    # Topology output format converters
+    convert_to_graphviz,
+    convert_to_mermaid,
     # Simulation affected components
     identify_affected_components,
 )
@@ -373,7 +375,7 @@ __all__ = [
     "analyze_owner_references",
     "analyze_service_dependencies",
     "analyze_volume_dependencies",
-    # Topology Graph Conversion
+    "handle_resource_fetch_error",
     "convert_to_graphviz",
     "convert_to_mermaid",
     # Resource Forecasting
