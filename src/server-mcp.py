@@ -966,7 +966,8 @@ def list_pods_in_namespace(namespace: str) -> List[Dict[str, Any]]:
         namespace: Kubernetes namespace to query.
 
     Returns:
-        List[Dict]: Pods with keys: name, status, ip, node_name, creation_timestamp.
+        List[Dict]: Pods with keys: name, status, ip, node_name, creation_timestamp,
+                    restart_count, container_states (list of waiting/terminated reasons).
     """
     if not k8s_core_api:
         return [{"error": "Kubernetes client not available."}]
@@ -976,12 +977,30 @@ def list_pods_in_namespace(namespace: str) -> List[Dict[str, Any]]:
         logger.info(f"Listing pods in namespace: {namespace}")
         pod_list = k8s_core_api.list_namespaced_pod(namespace=namespace).items
         for pod in pod_list:
+            # Extract container status information for better prioritization
+            total_restart_count = 0
+            container_states = []
+
+            if pod.status.container_statuses:
+                for cs in pod.status.container_statuses:
+                    if cs.restart_count:
+                        total_restart_count += cs.restart_count
+
+                    # Capture waiting state reasons (CrashLoopBackOff, ImagePullBackOff, etc.)
+                    if cs.state:
+                        if cs.state.waiting and cs.state.waiting.reason:
+                            container_states.append(cs.state.waiting.reason)
+                        elif cs.state.terminated and cs.state.terminated.reason:
+                            container_states.append(cs.state.terminated.reason)
+
             pods_info.append({
                 "name": pod.metadata.name,
                 "status": pod.status.phase,
                 "ip": pod.status.pod_ip,
                 "node_name": pod.spec.node_name if pod.spec else "N/A",
-                "creation_timestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else "N/A"
+                "creation_timestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else "N/A",
+                "restart_count": total_restart_count,
+                "container_states": container_states
             })
         logger.info(f"Found {len(pods_info)} pods in namespace '{namespace}'.")
         return pods_info
@@ -1996,7 +2015,7 @@ async def smart_get_namespace_events(
     last_n_events: Optional[int] = None,
     time_period: Optional[str] = None,
     strategy: str = "auto",
-    focus_areas: List[str] = ["errors", "warnings", "failures"],
+    focus_areas: Optional[List[str]] = None,
     max_context_tokens: int = 8000,
     include_summary: bool = True,
     severity_filter: Optional[List[str]] = None,
@@ -2022,6 +2041,9 @@ async def smart_get_namespace_events(
     Returns:
         Dict: Events with adaptive filtering, insights, and recommendations.
     """
+    # Handle mutable default argument - set default inside function
+    if focus_areas is None:
+        focus_areas = ["errors", "warnings", "failures"]
 
     tool_name = "smart_get_namespace_events"
     logger.info(f"[{tool_name}] Starting smart event analysis for namespace '{namespace}'")
@@ -5085,32 +5107,7 @@ async def prometheus_query(
 # ============================================================================
 # SMART LOG ANALYSIS HELPER FUNCTIONS
 # ============================================================================
-
-
-class AdaptiveLogProcessor:
-    """Helper class for adaptive log processing with token management."""
-
-    def __init__(self, max_token_budget: int = 150000):
-        self.max_token_budget = max_token_budget
-        self.safety_buffer = 0.8  # Use 80% of budget for safety
-        self.effective_budget = int(max_token_budget * self.safety_buffer)
-        self.used_tokens = 0
-
-    def can_process_more(self, estimated_tokens: int) -> bool:
-        """Check if we can process more data within token budget."""
-        return (self.used_tokens + estimated_tokens) <= self.effective_budget
-
-    def record_usage(self, actual_tokens: int):
-        """Record actual token usage."""
-        self.used_tokens += actual_tokens
-
-    def get_remaining_budget(self) -> int:
-        """Get remaining token budget."""
-        return max(0, self.effective_budget - self.used_tokens)
-
-    def get_usage_percentage(self) -> float:
-        """Get current token usage as percentage."""
-        return (self.used_tokens / self.effective_budget) * 100
+# Note: AdaptiveLogProcessor class is defined earlier in the file (around line 366)
 
 
 def _filter_analysis_for_synthesis(pod_analysis: Dict[str, Any], focus_areas: List[str]) -> Dict[str, Any]:
@@ -5591,7 +5588,7 @@ async def smart_summarize_pod_logs(
     pod_name: str,
     container_name: Optional[str] = None,
     summary_level: str = "detailed",
-    focus_areas: List[str] = ["errors", "warnings", "performance"],
+    focus_areas: Optional[List[str]] = None,
     time_segments: int = 5,
     max_context_tokens: int = 10000,
     since_seconds: Optional[int] = None,
@@ -5622,6 +5619,10 @@ async def smart_summarize_pod_logs(
     Returns:
         Dict[str, Any]: Log analysis with insights, patterns, and recommendations.
     """
+    # Handle mutable default argument - set default inside function
+    if focus_areas is None:
+        focus_areas = ["errors", "warnings", "performance"]
+
     start_timestamp = time.time()
     tool_name = "smart_summarize_pod_logs"
 
@@ -6065,7 +6066,7 @@ async def investigate_tls_certificate_issues(
 async def conservative_namespace_overview(
     namespace: str,
     max_pods: int = 10,
-    focus_areas: List[str] = ["errors", "warnings"],
+    focus_areas: Optional[List[str]] = None,
     sample_strategy: str = "smart"
 ) -> Dict[str, Any]:
     """
@@ -6082,6 +6083,10 @@ async def conservative_namespace_overview(
     Returns:
         Dict: Analysis results with pod health, issues detected, and recommendations.
     """
+    # Handle mutable default argument - set default inside function
+    if focus_areas is None:
+        focus_areas = ["errors", "warnings"]
+
     try:
         tool_name = "conservative_namespace_overview"
         logger.info(f"[{tool_name}] Starting conservative analysis of namespace '{namespace}' (max {max_pods} pods)")
@@ -6101,12 +6106,16 @@ async def conservative_namespace_overview(
         # Smart pod selection based on strategy
         if sample_strategy == "smart" and isinstance(pods_info, list):
             # Prioritize pods likely to have issues
+            # Uses container_states (CrashLoopBackOff, ImagePullBackOff, Error, OOMKilled)
+            # and restart_count from enhanced list_pods_in_namespace
+            error_states = {"CrashLoopBackOff", "ImagePullBackOff", "Error", "OOMKilled", "ContainerCannotRun"}
             prioritized_pods = sorted(pods_info, key=lambda p: (
-                p.get("status") == "Failed",  # Failed pods first
-                p.get("status") in ["CrashLoopBackOff", "Error", "ImagePullBackOff"],  # Error states
+                p.get("status") == "Failed",  # Failed pods first (pod phase)
+                any(state in error_states for state in p.get("container_states", [])),  # Container error states
+                p.get("restart_count", 0) > 0,  # Pods with restarts
+                p.get("restart_count", 0),  # Higher restart count = higher priority
                 "error" in p.get("name", "").lower(),  # Names suggesting issues
                 "failed" in p.get("name", "").lower(),
-                -(hash(p.get("name", "")) % 1000)  # Pseudo-random for remaining
             ), reverse=True)
         else:
             # Recent pods strategy
@@ -6203,7 +6212,7 @@ async def adaptive_namespace_investigation(
     namespace: str,
     investigation_query: str = "investigate all logs and events for potential issues",
     max_pods: int = 20,
-    focus_areas: List[str] = ["errors", "warnings", "performance"],
+    focus_areas: Optional[List[str]] = None,
     token_budget: int = 200000
 ) -> Dict[str, Any]:
     """
@@ -6221,6 +6230,23 @@ async def adaptive_namespace_investigation(
     Returns:
         Dict: Pod analysis, event correlation, findings, and recommendations.
     """
+    # Handle mutable default argument - set default inside function
+    if focus_areas is None:
+        focus_areas = ["errors", "warnings", "performance"]
+
+    # Input validation
+    if not namespace or not isinstance(namespace, str):
+        return {"error": "Invalid namespace parameter: must be a non-empty string"}
+    namespace = namespace.strip()
+    if not namespace:
+        return {"error": "Namespace cannot be empty or whitespace only"}
+
+    if not isinstance(max_pods, int) or max_pods <= 0:
+        max_pods = 20  # Reset to default if invalid
+
+    if not isinstance(token_budget, int) or token_budget <= 0:
+        token_budget = 200000  # Reset to default if invalid
+
     try:
         tool_name = "adaptive_namespace_investigation"
         logger.info(f"[{tool_name}] Starting adaptive investigation of namespace '{namespace}'")
@@ -6242,6 +6268,21 @@ async def adaptive_namespace_investigation(
         total_pods = len(pods_info) if isinstance(pods_info, list) else 0
         pods_to_analyze = min(max_pods, total_pods)
 
+        # Early return if no pods found
+        if total_pods == 0:
+            logger.info(f"[{tool_name}] No pods found in namespace '{namespace}'")
+            return {
+                "investigation_summary": {
+                    "namespace": namespace,
+                    "status": "no_pods_found",
+                    "message": f"No pods found in namespace '{namespace}'"
+                },
+                "pod_findings": {},
+                "namespace_events": {},
+                "critical_issues": [],
+                "recommendations": ["Verify namespace exists and has running workloads"]
+            }
+
         # Get namespace events for correlation (compressed for synthesis)
         events_result = await smart_get_namespace_events(
             namespace=namespace,
@@ -6250,7 +6291,9 @@ async def adaptive_namespace_investigation(
             max_context_tokens=discovery_budget // 2
         )
 
-        # Compress events immediately to prevent token overflow
+        # Validate events_result and compress for synthesis
+        if not isinstance(events_result, dict):
+            events_result = {"error": "Invalid events result type"}
         compressed_events = _compress_events_for_synthesis(events_result)
 
         processor.record_usage(discovery_budget // 2)  # Estimate discovery token usage
@@ -6267,36 +6310,69 @@ async def adaptive_namespace_investigation(
 
         # Prioritize pods for analysis
         if isinstance(pods_info, list) and pods_info:
-            # Sort pods by priority (failed, high restart count, recent)
+            # Sort pods by priority (failed, high restart count, container error states)
+            # Uses container_states and restart_count from enhanced list_pods_in_namespace
+            error_states = {"CrashLoopBackOff", "ImagePullBackOff", "Error", "OOMKilled", "ContainerCannotRun"}
             prioritized_pods = sorted(pods_info, key=lambda p: (
-                p.get("status") == "Failed",  # Failed pods first
-                p.get("status") in ["CrashLoopBackOff", "Error"],  # Error states next
+                p.get("status") == "Failed",  # Failed pods first (pod phase)
+                any(state in error_states for state in p.get("container_states", [])),  # Container error states
+                p.get("restart_count", 0) > 0,  # Pods with restarts
+                p.get("restart_count", 0),  # Higher restart count = higher priority
                 p.get("name", "").endswith(("-failed", "-error")),  # Names indicating issues
-                -(hash(p.get("name", "")) % 1000)  # Pseudo-random for remaining pods
             ), reverse=True)
 
-            for pod_info in prioritized_pods[:pods_to_analyze]:
-                if not processor.can_process_more(per_pod_budget):
-                    logger.info(f"Token budget exhausted - analyzed {pods_analyzed}/{pods_to_analyze} pods")
-                    break
+            # Process pods in parallel batches for performance
+            # Batch size balances parallelism with token budget checks
+            batch_size = 4
+            pods_to_process = prioritized_pods[:pods_to_analyze]
+            summary_level = "brief" if pods_to_analyze > 10 else "detailed"
+            max_tokens_per_pod = min(per_pod_budget, 15000)
 
+            async def analyze_single_pod(pod_info: Dict[str, Any]) -> Dict[str, Any]:
+                """Analyze a single pod and return results."""
                 pod_name = pod_info.get("name", "")
                 pod_status = pod_info.get("status", "Unknown")
-
                 try:
-                    # Use adaptive pod log analysis with per-pod budget
                     pod_analysis = await smart_summarize_pod_logs(
                         namespace=namespace,
                         pod_name=pod_name,
-                        summary_level="brief" if pods_to_analyze > 10 else "detailed",
+                        summary_level=summary_level,
                         focus_areas=focus_areas,
-                        max_context_tokens=min(per_pod_budget, 15000)
-                        # No time constraints = adaptive mode for each pod
+                        max_context_tokens=max_tokens_per_pod
                     )
+                    return {"pod_name": pod_name, "pod_status": pod_status, "analysis": pod_analysis, "error": None}
+                except Exception as e:
+                    logger.warning(f"Failed to analyze pod {pod_name}: {e}")
+                    return {"pod_name": pod_name, "pod_status": pod_status, "analysis": None, "error": str(e)}
 
-                    if "error" not in pod_analysis:
+            # Process in batches
+            for batch_start in range(0, len(pods_to_process), batch_size):
+                # Check token budget before starting batch
+                # GUARANTEE: Always process at least the first batch to ensure meaningful results
+                is_first_batch = (batch_start == 0)
+                actual_batch_size = min(batch_size, len(pods_to_process) - batch_start)
+                batch_budget_needed = per_pod_budget * actual_batch_size
+
+                if not is_first_batch and not processor.can_process_more(batch_budget_needed):
+                    logger.info(f"Token budget exhausted - analyzed {pods_analyzed}/{pods_to_analyze} pods")
+                    break
+
+                batch = pods_to_process[batch_start:batch_start + batch_size]
+                logger.info(f"[{tool_name}] Processing batch of {len(batch)} pods in parallel")
+
+                # Run batch in parallel
+                batch_results = await asyncio.gather(*[analyze_single_pod(p) for p in batch])
+
+                # Process batch results
+                for result in batch_results:
+                    pod_name = result["pod_name"]
+                    pod_status = result["pod_status"]
+
+                    if result["error"]:
+                        findings[pod_name] = {"status": pod_status, "error": result["error"]}
+                    elif result["analysis"] and "error" not in result["analysis"]:
                         # INTELLIGENT FILTERING: Only keep essential data to prevent token overflow
-                        filtered_analysis = _filter_analysis_for_synthesis(pod_analysis, focus_areas)
+                        filtered_analysis = _filter_analysis_for_synthesis(result["analysis"], focus_areas)
 
                         findings[pod_name] = {
                             "status": pod_status,
@@ -6305,25 +6381,21 @@ async def adaptive_namespace_investigation(
                         }
 
                         # Extract critical issues
-                        if pod_analysis.get("patterns", {}).get("errors"):
+                        if result["analysis"].get("patterns", {}).get("errors"):
                             critical_issues.extend([
                                 f"Pod {pod_name}: {error['content'][:100]}..."
-                                for error in pod_analysis["patterns"]["errors"][:2]
+                                for error in result["analysis"]["patterns"]["errors"][:2]
                             ])
 
                     processor.record_usage(per_pod_budget)  # Estimate usage
                     pods_analyzed += 1
 
-                    logger.info(f"Analyzed pod {pods_analyzed}/{pods_to_analyze}: {pod_name} (status: {pod_status})")
+                logger.info(f"[{tool_name}] Analyzed {pods_analyzed}/{pods_to_analyze} pods so far")
 
-                    # Early termination if many critical issues found
-                    if len(critical_issues) >= 10:
-                        logger.info(f"Early termination: {len(critical_issues)} critical issues found")
-                        break
-
-                except Exception as e:
-                    logger.warning(f"Failed to analyze pod {pod_name}: {e}")
-                    findings[pod_name] = {"status": pod_status, "error": str(e)}
+                # Early termination if many critical issues found
+                if len(critical_issues) >= 10:
+                    logger.info(f"Early termination: {len(critical_issues)} critical issues found")
+                    break
 
         # Phase 3: Synthesis (10% of budget)
         synthesis_budget = int(token_budget * 0.1)
@@ -6361,7 +6433,8 @@ async def adaptive_namespace_investigation(
             "recommendations": recommendations[:8],  # Limit to top 8 recommendations
             "adaptive_metadata": {
                 "processing_mode": "adaptive",
-                "token_efficiency": f"{pods_analyzed * 100 // max(1, processor.used_tokens)}% pods per 1k tokens",
+                "token_efficiency": f"{(pods_analyzed * 1000 / max(1, processor.used_tokens)):.3f} pods per 1k tokens",
+                "tokens_used": processor.used_tokens,
                 "coverage": f"{pods_analyzed}/{total_pods} pods analyzed",
                 "data_filtering": "applied to prevent token overflow",
                 "synthesis_optimized": True
@@ -7096,7 +7169,7 @@ async def progressive_event_analysis(
     time_period: Optional[str] = None,
     event_filters: Optional[Dict[str, Any]] = None,
     seed_event_id: Optional[str] = None,
-    focus_areas: List[str] = ["errors", "warnings", "failures"]
+    focus_areas: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Progressive event analysis with multiple detail levels and correlation detection.
@@ -7112,6 +7185,9 @@ async def progressive_event_analysis(
     Returns:
         Dict: Analysis results based on selected level.
     """
+    # Handle mutable default argument - set default inside function
+    if focus_areas is None:
+        focus_areas = ["errors", "warnings", "failures"]
 
     tool_name = "progressive_event_analysis"
     logger.info(f"[{tool_name}] Starting {analysis_level} analysis for namespace '{namespace}'")
