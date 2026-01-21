@@ -1734,10 +1734,17 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
             reverse=True
         )[:limit]
 
+        # Get ALL task runs in one API call (bulk fetch instead of N+1)
+        all_task_runs = await list_taskruns(namespace, pipeline_run=None)
+
+        # Create a set of pipeline run names for fast lookup
+        pr_names = {pr.get("name") for pr in pipeline_runs}
+
         # Collect durations for anomaly detection
         pipeline_data = []
         task_data = []
 
+        # Process pipeline runs
         for pr in pipeline_runs:
             # Parse pipeline duration
             if pr.get("status") == "Succeeded" and pr.get("duration") and pr.get("duration") != "unknown":
@@ -1751,20 +1758,24 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
                 except (ValueError, IndexError):
                     continue
 
-            # Get tasks for this pipeline
-            task_runs = await list_taskruns(namespace, pr.get("name"))
-            for tr in task_runs:
-                if tr.get("status") == "Succeeded" and tr.get("duration") and tr.get("duration") != "unknown":
-                    try:
-                        value = tr.get("duration").split()[0]
-                        if value.replace(".", "", 1).isdigit():
-                            task_data.append({
-                                "name": tr.get("name"),
-                                "duration": float(value),
-                                "pipeline_run": pr.get("name")
-                            })
-                    except (ValueError, IndexError):
-                        continue
+        # Process task runs (filter in memory - much faster than N API calls)
+        for tr in all_task_runs:
+            # Only include tasks belonging to our selected pipeline runs
+            tr_pipeline = tr.get("pipeline_run")
+            if tr_pipeline not in pr_names:
+                continue
+
+            if tr.get("status") == "Succeeded" and tr.get("duration") and tr.get("duration") != "unknown":
+                try:
+                    value = tr.get("duration").split()[0]
+                    if value.replace(".", "", 1).isdigit():
+                        task_data.append({
+                            "name": tr.get("name"),
+                            "duration": float(value),
+                            "pipeline_run": tr_pipeline
+                        })
+                except (ValueError, IndexError):
+                    continue
 
         # Detect anomalies
         pipeline_anomaly_result = detect_anomalies_in_data(
