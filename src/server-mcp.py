@@ -1728,9 +1728,10 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
         pipeline_runs = await list_pipelineruns(namespace)
 
         # Limit to the most recent runs
+        # Use 'or ""' to handle None values (not just missing keys)
         pipeline_runs = sorted(
             pipeline_runs,
-            key=lambda x: x.get("started_at", ""),
+            key=lambda x: x.get("started_at") or "",
             reverse=True
         )[:limit]
 
@@ -2684,7 +2685,8 @@ async def list_recent_pipeline_runs(limit: int = 10) -> Dict[str, List[Dict[str,
         logger.info(f"Found {len(all_runs)} pipeline runs from cluster-wide query")
 
         # Sort by start time (most recent first)
-        all_runs.sort(key=lambda x: x["start_time"], reverse=True)
+        # Use 'or ""' to handle None values
+        all_runs.sort(key=lambda x: x.get("start_time") or "", reverse=True)
 
         # Group by namespace (limited to top N)
         for run in all_runs[:limit]:
@@ -3287,13 +3289,14 @@ async def get_tekton_pipeline_runs_status(
         total_long_running = len(analysis['pipeline_runs']['long_running'])
 
         # Sort failures by start_time (most recent first) and apply limit
+        # Use 'or ""' to handle None values (not just missing keys)
         analysis['pipeline_runs']['recent_failures'].sort(
-            key=lambda x: x.get('start_time', ''), reverse=True
+            key=lambda x: x.get('start_time') or '', reverse=True
         )
         analysis['pipeline_runs']['recent_failures'] = analysis['pipeline_runs']['recent_failures'][:recent_failures_limit]
 
         analysis['task_runs']['recent_failures'].sort(
-            key=lambda x: x.get('start_time', ''), reverse=True
+            key=lambda x: x.get('start_time') or '', reverse=True
         )
         analysis['task_runs']['recent_failures'] = analysis['task_runs']['recent_failures'][:recent_failures_limit]
 
@@ -6130,7 +6133,7 @@ async def conservative_namespace_overview(
             ), reverse=True)
         else:
             # Recent pods strategy
-            prioritized_pods = sorted(pods_info, key=lambda p: p.get("creation_timestamp", ""), reverse=True)
+            prioritized_pods = sorted(pods_info, key=lambda p: p.get("creation_timestamp") or "", reverse=True)
 
         # Analyze selected pods with strict token limits
         findings = {}
