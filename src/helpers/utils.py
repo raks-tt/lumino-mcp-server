@@ -662,8 +662,8 @@ def calculate_utilization(used: str, limit: str) -> float:
     """
     Calculate the utilization percentage of a resource.
 
-    Handles both CPU values (e.g., "200m", "0.5") and memory values
-    (e.g., "256Mi", "1Gi", "512M").
+    Handles CPU values (e.g., "200m", "0.5"), memory values
+    (e.g., "256Mi", "1Gi", "512M"), and count values (e.g., "2k", "100").
 
     Args:
         used: Current resource usage as string
@@ -678,9 +678,18 @@ def calculate_utilization(used: str, limit: str) -> float:
                 return float(value[:-1]) / 1000.0
             return float(value)
 
-        def parse_memory(value: str) -> float:
-            units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40,
-                     "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+        def parse_quantity(value: str) -> float:
+            """Parse Kubernetes quantity values including memory, count, and SI suffixes."""
+            # Handle binary (Ki, Mi, Gi, Ti) and decimal (k, K, M, G, T) suffixes
+            # Note: lowercase 'k' is commonly used for count quotas (e.g., "2k" = 2000)
+            units = {
+                # Binary suffixes (IEC)
+                "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "Pi": 2**50, "Ei": 2**60,
+                # Decimal suffixes (SI) - uppercase
+                "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12, "P": 10**15, "E": 10**18,
+                # Lowercase 'k' for count-based quotas
+                "k": 10**3
+            }
 
             for suffix, multiplier in units.items():
                 if value.endswith(suffix):
@@ -695,8 +704,8 @@ def calculate_utilization(used: str, limit: str) -> float:
             used_value = parse_cpu(used)
             limit_value = parse_cpu(limit)
         else:
-            used_value = parse_memory(used)
-            limit_value = parse_memory(limit)
+            used_value = parse_quantity(used)
+            limit_value = parse_quantity(limit)
 
         if limit_value == 0:
             return 0
