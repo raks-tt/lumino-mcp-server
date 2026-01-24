@@ -5,6 +5,24 @@ All notable changes to Lumino MCP Server will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-01-24
+
+### Added
+- MCP Registry support with `server.json` for registry submission
+- `[tool.mcp]` section in pyproject.toml for registry integration
+- Published to [PyPI](https://pypi.org/project/lumino-mcp-server/) with full README documentation
+
+### Changed
+- Updated package description to better reflect SRE observability capabilities
+- Added keywords: `sre`, `observability`, `pipelines`
+
+### Fixed
+- `analyze_failed_pipeline` - Handle deleted pods gracefully with fallback to TaskRun step info
+- `check_cluster_certificate_health` - Fix duplicate namespace entries and respect user namespace filter
+- `check_resource_constraints` - Add lowercase 'k' suffix support for count quotas (e.g., "2k" = 2000)
+- `detect_log_anomalies` - Fix pattern key extraction showing "?i)" instead of category names
+- `ci_cd_performance_baselining` - Filter out "unknown" task entries from Prometheus metrics
+
 ## [0.9.0] - 2026-01-18
 
 ### Added
