@@ -1,14 +1,14 @@
 [project]
 name = "lumino-mcp-server"
-version = "0.9.0"
-description = "Open source MCP Server for Kubernetes, OpenShift, and Tekton monitoring"
+version = "0.9.1"
+description = "An open source MCP server empowering SREs with intelligent observability, predictive analytics, and AI-driven automation across Kubernetes, OpenShift, and Tekton environments."
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
     {name = "Lumino Team"}
 ]
-keywords = ["mcp", "kubernetes", "openshift", "tekton", "monitoring", "ai"]
+keywords = ["mcp", "kubernetes", "openshift", "tekton", "monitoring", "ai", "sre", "observability", "pipelines"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -46,6 +46,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
+
+# MCP Registry integration
+[tool.mcp]
+name = "io.github.spre-sre/lumino"
 
 [tool.uv]
 dev-dependencies = [
