@@ -190,9 +190,23 @@ def matches_trace_identifier(pipeline_run: Dict[str, Any], trace_identifier: str
 
     elif trace_type == "pr":
         # Look for PR number in labels and annotations
-        pr_keys = ["pipelinesascode.tekton.dev/pull-request", "pull-request", "pr"]
+        # Support multiple PAC label formats used by different Konflux/Tekton installations
+        pr_keys = [
+            "pac.test.appstudio.openshift.io/pull-request",  # Konflux/AppStudio PAC
+            "pipelinesascode.tekton.dev/pull-request",       # Standard PAC
+            "pull-request",
+            "pr"
+        ]
         for key in pr_keys:
             if labels.get(key) == trace_identifier or annotations.get(key) == trace_identifier:
+                return True
+        # Also check annotation keys that might store PR info
+        pr_annotation_keys = [
+            "pipelinesascode.tekton.dev/pull-request",
+            "build.appstudio.openshift.io/pull_request_number"
+        ]
+        for key in pr_annotation_keys:
+            if annotations.get(key) == trace_identifier:
                 return True
         return False
 
