@@ -1260,6 +1260,15 @@ async def get_pipelinerun_logs(
 
     Prioritizes failed pods and manages token budgets automatically when no time/line filters specified.
 
+    IMPORTANT: If this tool returns "No pods found", the pods may have been garbage collected by Kubernetes.
+    In that case, use KubeArchive to retrieve archived logs via Bash commands:
+
+    1. Discover KubeArchive endpoint:
+       kubectl get routes -A -o jsonpath='{range .items[*]}{.spec.host}{"\\n"}{end}' | grep kubearchive
+
+    2. Retrieve archived logs:
+       kubectl ka logs pipelineruns/<pipelinerun_name> -n <namespace> --host https://<kubearchive-host>
+
     Args:
         pipelinerun_name: PipelineRun name.
         namespace: Kubernetes namespace.
@@ -1273,6 +1282,7 @@ async def get_pipelinerun_logs(
 
     Returns:
         Dict[str, Any]: Pod names as keys, logs as values. Includes "_metadata" with processing info.
+        Returns {"info": "No pods found..."} if pods are garbage collected - use KubeArchive fallback.
     """
     # Build log filtering info for logging
     filter_info = []
@@ -2505,6 +2515,14 @@ async def analyze_failed_pipeline(namespace: str, pipeline_run: str) -> Dict[str
     Perform root cause analysis on a failed Tekton PipelineRun.
 
     Fetches pipeline/task details, analyzes logs for errors, and provides remediation recommendations.
+
+    NOTE: If logs are unavailable due to pod garbage collection, use KubeArchive to retrieve archived logs:
+
+    1. Discover KubeArchive endpoint:
+       kubectl get routes -A -o jsonpath='{range .items[*]}{.spec.host}{"\\n"}{end}' | grep kubearchive
+
+    2. Retrieve archived logs:
+       kubectl ka logs pipelineruns/<pipeline_run> -n <namespace> --host https://<kubearchive-host>
 
     Args:
         namespace: Kubernetes namespace of the PipelineRun.
@@ -7476,6 +7494,14 @@ async def automated_triage_rca_report_generator(
     Generate automated Root Cause Analysis (RCA) report for pipeline/pod failures.
 
     Performs log analysis, resource checks, event correlation, and provides remediation suggestions.
+
+    NOTE: If logs are unavailable due to pod garbage collection, use KubeArchive to retrieve archived logs:
+
+    1. Discover KubeArchive endpoint:
+       kubectl get routes -A -o jsonpath='{range .items[*]}{.spec.host}{"\\n"}{end}' | grep kubearchive
+
+    2. Retrieve archived logs:
+       kubectl ka logs pipelineruns/<failure_identifier> -n <namespace> --host https://<kubearchive-host>
 
     Args:
         failure_identifier: Pipeline run name, pod name, or failure event ID.
