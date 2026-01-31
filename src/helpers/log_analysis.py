@@ -985,11 +985,24 @@ def train_or_load_model(
 
 
 def analyze_log_patterns_for_failure_prediction(log_data: pd.DataFrame, historical_failures: List[Dict]) -> Dict[str, Any]:
-    """Analyze log patterns to predict potential failures."""
+    """Analyze log patterns to predict potential failures.
+
+    Args:
+        log_data: DataFrame with preprocessed log data
+        historical_failures: List of historical failure labels from TrainingDataStore
+
+    Returns:
+        Dict with failure_patterns, risk_score, and historical_context
+    """
     failure_patterns = []
+    historical_context = {
+        'total_historical_failures': len(historical_failures),
+        'failure_types_seen': {},
+        'recent_failures': []
+    }
 
     # Pattern 1: High error rate
-    error_rate = log_data['error_indicators'].mean()
+    error_rate = log_data['error_indicators'].mean() if 'error_indicators' in log_data.columns else 0
     if error_rate > 0.1:  # More than 10% error indicators
         failure_patterns.append({
             'pattern': 'high_error_rate',
@@ -998,73 +1011,253 @@ def analyze_log_patterns_for_failure_prediction(log_data: pd.DataFrame, historic
         })
 
     # Pattern 2: Entropy spikes (indicating unusual log patterns)
-    entropy_threshold = log_data['message_entropy'].mean() + 2 * log_data['message_entropy'].std()
-    entropy_spikes = (log_data['message_entropy'] > entropy_threshold).sum()
-    if entropy_spikes > len(log_data) * 0.05:  # More than 5% of logs are entropy spikes
-        failure_patterns.append({
-            'pattern': 'entropy_spikes',
-            'severity': 'medium',
-            'value': entropy_spikes / len(log_data)
-        })
+    if 'message_entropy' in log_data.columns and len(log_data) > 0:
+        entropy_mean = log_data['message_entropy'].mean()
+        entropy_std = log_data['message_entropy'].std()
+        if entropy_std > 0:
+            entropy_threshold = entropy_mean + 2 * entropy_std
+            entropy_spikes = (log_data['message_entropy'] > entropy_threshold).sum()
+            if entropy_spikes > len(log_data) * 0.05:
+                failure_patterns.append({
+                    'pattern': 'entropy_spikes',
+                    'severity': 'medium',
+                    'value': entropy_spikes / len(log_data)
+                })
 
     # Pattern 3: Message length anomalies
-    length_threshold = log_data['message_length'].mean() + 3 * log_data['message_length'].std()
-    length_anomalies = (log_data['message_length'] > length_threshold).sum()
-    if length_anomalies > 0:
-        failure_patterns.append({
-            'pattern': 'message_length_anomalies',
-            'severity': 'low',
-            'value': length_anomalies
-        })
+    if 'message_length' in log_data.columns and len(log_data) > 0:
+        length_mean = log_data['message_length'].mean()
+        length_std = log_data['message_length'].std()
+        if length_std > 0:
+            length_threshold = length_mean + 3 * length_std
+            length_anomalies = (log_data['message_length'] > length_threshold).sum()
+            if length_anomalies > 0:
+                failure_patterns.append({
+                    'pattern': 'message_length_anomalies',
+                    'severity': 'low',
+                    'value': length_anomalies
+                })
+
+    # Pattern 4: Analyze historical failures for predictive patterns
+    if historical_failures:
+        # Count failure types
+        failure_type_counts = {}
+        severity_counts = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+
+        for failure in historical_failures:
+            ftype = failure.get('failure_type', 'unknown')
+            severity = failure.get('severity', 'medium')
+
+            failure_type_counts[ftype] = failure_type_counts.get(ftype, 0) + 1
+            if severity in severity_counts:
+                severity_counts[severity] += 1
+
+        historical_context['failure_types_seen'] = failure_type_counts
+        historical_context['severity_distribution'] = severity_counts
+
+        # Add recent failures to context (last 5)
+        historical_context['recent_failures'] = [
+            {
+                'failure_type': f.get('failure_type'),
+                'severity': f.get('severity'),
+                'resource_name': f.get('resource_name'),
+                'failure_time': f.get('failure_time')
+            }
+            for f in historical_failures[:5]
+        ]
+
+        # Pattern: Recurring failure types indicate elevated risk
+        for ftype, count in failure_type_counts.items():
+            if count >= 2:  # Same failure type occurred 2+ times
+                failure_patterns.append({
+                    'pattern': 'recurring_failure',
+                    'severity': 'high',
+                    'value': count,
+                    'failure_type': ftype,
+                    'description': f"'{ftype}' failure occurred {count} times in last 24h"
+                })
+
+        # Pattern: Critical/high severity failures in recent history
+        critical_high = severity_counts['critical'] + severity_counts['high']
+        if critical_high > 0:
+            failure_patterns.append({
+                'pattern': 'recent_critical_failures',
+                'severity': 'high' if severity_counts['critical'] > 0 else 'medium',
+                'value': critical_high,
+                'description': f"{critical_high} critical/high severity failures in last 24h"
+            })
+
+        # Pattern: High failure density (many failures in short time)
+        if len(historical_failures) >= 5:
+            failure_patterns.append({
+                'pattern': 'high_failure_density',
+                'severity': 'high',
+                'value': len(historical_failures),
+                'description': f"{len(historical_failures)} failures in last 24h indicates instability"
+            })
+
+    # Calculate risk score with historical failure weighting
+    base_risk = (
+        sum(1 for p in failure_patterns if p['severity'] == 'high') * 0.5 +
+        sum(1 for p in failure_patterns if p['severity'] == 'medium') * 0.3 +
+        sum(1 for p in failure_patterns if p['severity'] == 'low') * 0.1
+    )
+
+    # Boost risk score based on historical failure count (up to 0.5 additional)
+    historical_boost = min(len(historical_failures) * 0.05, 0.5) if historical_failures else 0
+
+    # Total risk score capped at 2.0
+    risk_score = min(base_risk + historical_boost, 2.0)
 
     return {
         'failure_patterns': failure_patterns,
-        'risk_score': sum(1 for p in failure_patterns if p['severity'] == 'high') * 0.5 +
-                     sum(1 for p in failure_patterns if p['severity'] == 'medium') * 0.3 +
-                     sum(1 for p in failure_patterns if p['severity'] == 'low') * 0.1
+        'risk_score': risk_score,
+        'historical_context': historical_context
     }
 
-def generate_failure_predictions(patterns: Dict[str, Any], confidence_threshold: float, prediction_window: str) -> List[Dict[str, Any]]:
-    """Generate failure predictions based on detected patterns."""
+def generate_failure_predictions(
+    patterns: Dict[str, Any],
+    confidence_threshold: float,
+    prediction_window: str,
+    historical_failures: Optional[List[Dict]] = None,
+    labels: Optional[Any] = None
+) -> List[Dict[str, Any]]:
+    """Generate failure predictions based on detected patterns and historical data.
+
+    Args:
+        patterns: Output from analyze_log_patterns_for_failure_prediction
+        confidence_threshold: Minimum confidence for predictions
+        prediction_window: Time window for predictions
+        historical_failures: List of historical failure labels
+        labels: Binary labels from log-failure correlations (numpy array)
+
+    Returns:
+        List of prediction dicts with failure_type, predicted_time, confidence, etc.
+    """
     predictions = []
+    historical_failures = historical_failures or []
 
-    risk_score = patterns['risk_score']
-    confidence = min(risk_score * 0.8, 0.95)  # Cap confidence at 95%
+    risk_score = patterns.get('risk_score', 0)
+    failure_patterns = patterns.get('failure_patterns', [])
+    historical_context = patterns.get('historical_context', {})
 
+    # Calculate base confidence from risk score
+    base_confidence = min(risk_score * 0.6, 0.95)
+
+    # Boost confidence if we have labeled data correlations
+    label_boost = 0.0
+    if labels is not None:
+        try:
+            import numpy as np
+            if isinstance(labels, np.ndarray) and len(labels) > 0:
+                # Percentage of logs correlated with failures
+                failure_correlation_rate = np.mean(labels)
+                if failure_correlation_rate > 0.1:
+                    label_boost = min(failure_correlation_rate * 0.3, 0.2)
+        except Exception:
+            pass
+
+    # Boost confidence based on historical failure count
+    historical_boost = 0.0
+    if historical_failures:
+        # More historical failures = higher confidence in prediction
+        historical_boost = min(len(historical_failures) * 0.02, 0.15)
+
+    # Combined confidence
+    confidence = min(base_confidence + label_boost + historical_boost, 0.95)
+
+    # Calculate predicted time based on window
+    window_hours = {
+        "1h": 1, "6h": 6, "24h": 24, "7d": 168
+    }.get(prediction_window, 6)
+
+    predicted_time = (datetime.now() + timedelta(hours=window_hours)).isoformat()
+
+    # Generate predictions from patterns
     if confidence >= confidence_threshold:
-        # Calculate predicted time based on window
-        window_hours = {
-            "1h": 1, "6h": 6, "24h": 24, "7d": 168
-        }.get(prediction_window, 6)
-
-        predicted_time = (datetime.now() + timedelta(hours=window_hours)).isoformat()
-
-        # Determine failure type based on patterns
         failure_types = []
         affected_components = []
         warning_indicators = []
         recommended_actions = []
 
-        for pattern in patterns['failure_patterns']:
-            if pattern['pattern'] == 'high_error_rate':
+        for pattern in failure_patterns:
+            pattern_type = pattern.get('pattern', '')
+
+            if pattern_type == 'high_error_rate':
                 failure_types.append('service_degradation')
                 affected_components.append('application_pods')
                 warning_indicators.append(f"Error rate at {pattern['value']:.2%}")
                 recommended_actions.append("Investigate error logs and increase monitoring")
-            elif pattern['pattern'] == 'entropy_spikes':
+
+            elif pattern_type == 'entropy_spikes':
                 failure_types.append('unusual_behavior')
                 affected_components.append('logging_system')
                 warning_indicators.append(f"Entropy spikes in {pattern['value']:.2%} of logs")
                 recommended_actions.append("Check for configuration changes or new deployments")
 
-        predictions.append({
-            'failure_type': failure_types[0] if failure_types else 'general_failure',
-            'predicted_time': predicted_time,
-            'confidence': confidence,
-            'affected_components': affected_components,
-            'warning_indicators': warning_indicators,
-            'recommended_actions': recommended_actions
-        })
+            elif pattern_type == 'recurring_failure':
+                ftype = pattern.get('failure_type', 'unknown')
+                failure_types.append(ftype)
+                affected_components.append(pattern.get('resource_type', 'unknown'))
+                warning_indicators.append(pattern.get('description', f"Recurring {ftype} failures"))
+                recommended_actions.append(f"Investigate root cause of recurring '{ftype}' failures")
+
+            elif pattern_type == 'recent_critical_failures':
+                failure_types.append('critical_failure_risk')
+                affected_components.append('cluster')
+                warning_indicators.append(pattern.get('description', 'Recent critical failures detected'))
+                recommended_actions.append("Review recent critical failures and ensure fixes are in place")
+
+            elif pattern_type == 'high_failure_density':
+                failure_types.append('system_instability')
+                affected_components.append('cluster')
+                warning_indicators.append(pattern.get('description', 'High failure density detected'))
+                recommended_actions.append("Perform comprehensive system health check")
+
+        # Create prediction entry
+        if failure_types:
+            predictions.append({
+                'failure_type': failure_types[0],
+                'all_failure_types': list(set(failure_types)),
+                'predicted_time': predicted_time,
+                'confidence': round(confidence, 3),
+                'affected_components': list(set(affected_components)),
+                'warning_indicators': warning_indicators,
+                'recommended_actions': list(set(recommended_actions)),
+                'based_on_patterns': len(failure_patterns),
+                'based_on_historical_failures': len(historical_failures),
+                'has_labeled_correlations': labels is not None and label_boost > 0
+            })
+
+    # Also generate predictions directly from historical failures if no pattern-based predictions
+    # and we have enough historical data
+    if not predictions and historical_failures and len(historical_failures) >= 3:
+        # Find the most common failure type
+        failure_type_counts = historical_context.get('failure_types_seen', {})
+        if failure_type_counts:
+            most_common = max(failure_type_counts.items(), key=lambda x: x[1])
+            ftype, count = most_common
+
+            # Generate prediction based on historical pattern
+            historical_confidence = min(0.5 + (count * 0.1), 0.85)
+
+            if historical_confidence >= confidence_threshold:
+                predictions.append({
+                    'failure_type': ftype,
+                    'predicted_time': predicted_time,
+                    'confidence': round(historical_confidence, 3),
+                    'affected_components': ['cluster'],
+                    'warning_indicators': [
+                        f"'{ftype}' failure occurred {count} times recently",
+                        f"Based on {len(historical_failures)} historical failures"
+                    ],
+                    'recommended_actions': [
+                        f"Proactively address '{ftype}' failure patterns",
+                        "Review recent changes that may have introduced instability"
+                    ],
+                    'prediction_source': 'historical_pattern',
+                    'based_on_historical_failures': len(historical_failures)
+                })
 
     return predictions
 

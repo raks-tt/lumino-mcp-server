@@ -2032,6 +2032,94 @@ async def _get_namespace_events_internal(
         }
 
 
+async def _get_namespace_events_as_dicts(
+    namespace: str,
+    limit: int = 100,
+    time_period: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Fetch Kubernetes events as dictionaries for use with FailureEventCollector.
+
+    Unlike _get_namespace_events_internal which returns formatted strings,
+    this function returns raw event data as dictionaries.
+
+    Args:
+        namespace: Kubernetes namespace to fetch events from
+        limit: Maximum number of events to fetch
+        time_period: Optional time period like '1h', '30m', '2d'
+
+    Returns:
+        List of event dictionaries with keys: type, reason, message,
+        involved_object, last_timestamp, first_timestamp, count, name
+    """
+    from datetime import datetime, timedelta
+
+    events_as_dicts: List[Dict[str, Any]] = []
+
+    try:
+        # Calculate time filter if provided
+        cutoff_time = None
+        if time_period is not None:
+            try:
+                time_delta = parse_time_period(time_period)
+                cutoff_time = datetime.now() - time_delta
+            except Exception as e:
+                logger.debug(f"Error parsing time period: {e}")
+
+        # Fetch events
+        event_list_response = await asyncio.to_thread(
+            k8s_core_api.list_namespaced_event,
+            namespace=namespace,
+            watch=False,
+            limit=limit
+        )
+
+        for event in event_list_response.items:
+            try:
+                # Apply time filter if specified
+                if cutoff_time:
+                    event_time = event.last_timestamp or event.first_timestamp
+                    if event_time:
+                        if event_time.tzinfo is not None:
+                            event_time = event_time.replace(tzinfo=None)
+                        if event_time < cutoff_time:
+                            continue
+
+                # Convert to dict format expected by FailureEventCollector
+                event_dict = {
+                    "type": event.type or "Normal",
+                    "reason": event.reason or "",
+                    "message": event.message or "",
+                    "name": event.metadata.name if event.metadata else "",
+                    "last_timestamp": event.last_timestamp.isoformat() if event.last_timestamp else None,
+                    "first_timestamp": event.first_timestamp.isoformat() if event.first_timestamp else None,
+                    "count": event.count or 1,
+                    "involved_object": {}
+                }
+
+                # Extract involved object details
+                if event.involved_object:
+                    event_dict["involved_object"] = {
+                        "name": event.involved_object.name or "",
+                        "kind": event.involved_object.kind or "",
+                        "namespace": event.involved_object.namespace or namespace,
+                        "uid": event.involved_object.uid or ""
+                    }
+
+                events_as_dicts.append(event_dict)
+
+            except Exception as e:
+                logger.debug(f"Error converting event to dict: {e}")
+                continue
+
+        logger.debug(f"Fetched {len(events_as_dicts)} events as dicts from {namespace}")
+        return events_as_dicts
+
+    except Exception as e:
+        logger.debug(f"Failed to fetch events as dicts from {namespace}: {e}")
+        return []
+
+
 @mcp.tool()
 async def smart_get_namespace_events(
     namespace: str,
@@ -10349,10 +10437,11 @@ async def predictive_log_analyzer(
                 # Collect failure events from the target namespaces
                 for ns in target_namespaces:
                     try:
-                        # Collect from Kubernetes events
-                        events_result = await _get_namespace_events_internal(ns, limit=100)
-                        if events_result and "events" in events_result:
-                            failure_collector.collect_from_events(events_result["events"], ns)
+                        # Collect from Kubernetes events - use dict format for FailureEventCollector
+                        events_as_dicts = await _get_namespace_events_as_dicts(ns, limit=100)
+                        if events_as_dicts:
+                            count = failure_collector.collect_from_events(events_as_dicts, ns)
+                            logger.debug(f"Collected {count} failure labels from events in {ns}")
 
                         # Collect from pod statuses
                         pods = k8s_core_api.list_namespaced_pod(namespace=ns, limit=50)
@@ -10456,12 +10545,29 @@ async def predictive_log_analyzer(
                     "status": status
                 })
 
-        # Analyze patterns for failure prediction
-        pattern_analysis = analyze_log_patterns_for_failure_prediction(log_df, [])
+        # Analyze patterns for failure prediction - pass historical failures for correlation
+        historical_failures_for_analysis = []
+        if persistence_available and training_store:
+            try:
+                from datetime import timedelta
+                historical_failures_for_analysis = training_store.get_failure_labels_in_window(
+                    start_time=datetime.now() - timedelta(hours=24),
+                    end_time=datetime.now()
+                )
+            except Exception as e:
+                logger.debug(f"Could not retrieve historical failures: {e}")
 
-        # Generate predictions
+        pattern_analysis = analyze_log_patterns_for_failure_prediction(
+            log_df, historical_failures_for_analysis
+        )
+
+        # Generate predictions using both pattern analysis and labeled data
         predictions = generate_failure_predictions(
-            pattern_analysis, confidence_threshold, prediction_window
+            pattern_analysis,
+            confidence_threshold,
+            prediction_window,
+            historical_failures=historical_failures_for_analysis,
+            labels=labels
         )
         result["predictions"] = predictions
 
@@ -10496,6 +10602,12 @@ async def predictive_log_analyzer(
         else:
             result["trend_analysis"]["performance_trend"] = "stable"
 
+        # Update has_failure_labels to correctly reflect historical failures used
+        result["model_info"]["has_failure_labels"] = (
+            (labels is not None and len(labels) > 0) or
+            (historical_failures_for_analysis and len(historical_failures_for_analysis) > 0)
+        )
+
         logger.info(f"Predictive analysis complete: {len(predictions)} predictions generated")
         return result
 
@@ -10522,6 +10634,249 @@ async def predictive_log_analyzer(
                 "has_failure_labels": False,
                 "persistence_enabled": False
             },
+            "error": str(e)
+        }
+
+
+@mcp.tool()
+@log_tool_execution
+async def manage_prediction_training_data(
+    action: str = "stats",
+    failure_type: Optional[str] = None,
+    namespace: Optional[str] = None,
+    resource_name: Optional[str] = None,
+    severity: Optional[str] = None,
+    collect_from_namespaces: Optional[List[str]] = None,
+    max_namespaces: int = 10
+) -> Dict[str, Any]:
+    """
+    Manage training data for the predictive log analyzer.
+
+    This tool allows viewing, collecting, and managing failure labels used for
+    supervised learning in the predictive_log_analyzer.
+
+    Args:
+        action: Action to perform:
+            - "stats": Get training data statistics (default)
+            - "list_failures": List recent failure labels
+            - "add_failure": Manually add a failure label
+            - "collect": Trigger failure collection from namespaces
+            - "cleanup": Remove old training data
+        failure_type: For add_failure - type of failure (e.g., "crash", "oom", "image", "timeout")
+        namespace: For add_failure/list_failures - namespace filter
+        resource_name: For add_failure - name of the affected resource
+        severity: For add_failure - severity level ("critical", "high", "medium", "low")
+        collect_from_namespaces: For collect - specific namespaces to collect from
+        max_namespaces: For collect - maximum namespaces when auto-detecting
+
+    Returns:
+        Dict with action results: statistics, failure list, or operation status.
+    """
+    try:
+        from helpers.ml_persistence import (
+            TrainingDataStore,
+            FailureEventCollector,
+            ModelPersistenceManager
+        )
+
+        training_store = TrainingDataStore()
+        model_manager = ModelPersistenceManager()
+
+        result = {
+            "action": action,
+            "success": True,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        if action == "stats":
+            # Get comprehensive training data statistics
+            stats = training_store.get_statistics()
+
+            # Get model info
+            models = model_manager.list_models()
+            current_model_id = model_manager.get_current_model_id()
+
+            result["statistics"] = {
+                "training_data": stats,
+                "models": {
+                    "total_models": len(models),
+                    "current_model_id": current_model_id,
+                    "recent_models": [
+                        {
+                            "model_id": m.get("model_id"),
+                            "created_at": m.get("created_at"),
+                            "training_samples": m.get("training_samples", 0)
+                        }
+                        for m in models[-5:]
+                    ] if models else []
+                },
+                "recommendations": []
+            }
+
+            # Add recommendations
+            if stats.get("total_failure_labels", 0) < 10:
+                result["statistics"]["recommendations"].append(
+                    "Collect more failure labels using action='collect' to improve predictions"
+                )
+            if stats.get("total_log_samples", 0) < 100:
+                result["statistics"]["recommendations"].append(
+                    "Run predictive_log_analyzer to collect more log samples"
+                )
+            if stats.get("total_correlations", 0) == 0:
+                result["statistics"]["recommendations"].append(
+                    "No log-failure correlations yet. Labels will be correlated during analysis."
+                )
+
+        elif action == "list_failures":
+            # List recent failure labels
+            from datetime import timedelta
+            failures = training_store.get_failure_labels_in_window(
+                start_time=datetime.now() - timedelta(days=7),
+                end_time=datetime.now()
+            )
+
+            # Filter by namespace if specified
+            if namespace:
+                failures = [f for f in failures if f.get("namespace") == namespace]
+
+            result["failures"] = failures[:50]  # Limit to 50
+            result["total_count"] = len(failures)
+            result["filter_applied"] = {"namespace": namespace} if namespace else None
+
+        elif action == "add_failure":
+            # Manually add a failure label
+            if not failure_type:
+                result["success"] = False
+                result["error"] = "failure_type is required for add_failure action"
+                return result
+
+            label = {
+                "failure_type": failure_type,
+                "severity": severity or "medium",
+                "namespace": namespace or "unknown",
+                "resource_name": resource_name or "manual_entry",
+                "resource_type": "manual",
+                "failure_time": datetime.now().isoformat(),
+                "detection_source": "manual",
+                "error_category": failure_type,
+                "metadata": {
+                    "source": "manage_prediction_training_data",
+                    "added_by": "user"
+                }
+            }
+
+            label_id = training_store.store_failure_label(label)
+
+            if label_id:
+                result["label_id"] = label_id
+                result["message"] = f"Successfully added failure label for '{failure_type}'"
+            else:
+                result["success"] = False
+                result["message"] = "Failed to add label (may be duplicate)"
+
+        elif action == "collect":
+            # Trigger failure collection from namespaces
+            failure_collector = FailureEventCollector(training_store)
+            collected_counts = {
+                "from_events": 0,
+                "from_pods": 0,
+                "from_pipelines": 0,
+                "namespaces_scanned": 0
+            }
+
+            # Determine namespaces to scan
+            if collect_from_namespaces:
+                target_namespaces = collect_from_namespaces
+            else:
+                # Auto-detect active namespaces
+                try:
+                    all_ns = await list_namespaces()
+                    tekton_ns = await detect_tekton_namespaces()
+                    active_ns = []
+                    for category in tekton_ns.values():
+                        active_ns.extend(category)
+                    target_namespaces = list(set(active_ns))[:max_namespaces] if active_ns else all_ns[:max_namespaces]
+                except Exception:
+                    target_namespaces = []
+
+            for ns in target_namespaces:
+                try:
+                    collected_counts["namespaces_scanned"] += 1
+
+                    # Collect from events - use dict format for FailureEventCollector
+                    try:
+                        events_as_dicts = await _get_namespace_events_as_dicts(ns, limit=200)
+                        if events_as_dicts:
+                            count = failure_collector.collect_from_events(events_as_dicts, ns)
+                            collected_counts["from_events"] += count
+                    except Exception as e:
+                        logger.debug(f"Failed to collect events from {ns}: {e}")
+
+                    # Collect from pod statuses
+                    try:
+                        pods = k8s_core_api.list_namespaced_pod(namespace=ns, limit=100)
+                        count = failure_collector.collect_from_pod_status(pods.items, ns)
+                        collected_counts["from_pods"] += count
+                    except Exception as e:
+                        logger.debug(f"Failed to collect pod statuses from {ns}: {e}")
+
+                    # Collect from pipeline runs
+                    try:
+                        prs = await list_pipelineruns(namespace=ns)
+                        if prs and isinstance(prs, list):
+                            # Filter to failed pipelines
+                            failed_prs = [pr for pr in prs if pr.get("status") in ["Failed", "Error", "CouldntGetTask"]]
+                            count = failure_collector.collect_from_pipeline_runs(
+                                [{"status": {"conditions": [{"type": "Succeeded", "status": "False", "message": pr.get("status", "")}]},
+                                  "metadata": {"name": pr.get("name"), "creationTimestamp": pr.get("started_at")},
+                                  "spec": {"pipelineRef": {"name": pr.get("pipeline", "")}}}
+                                 for pr in failed_prs],
+                                ns
+                            )
+                            collected_counts["from_pipelines"] += count
+                    except Exception as e:
+                        logger.debug(f"Failed to collect pipeline runs from {ns}: {e}")
+
+                except Exception as e:
+                    logger.debug(f"Failed to scan namespace {ns}: {e}")
+
+            result["collected"] = collected_counts
+            result["total_collected"] = sum([
+                collected_counts["from_events"],
+                collected_counts["from_pods"],
+                collected_counts["from_pipelines"]
+            ])
+            result["message"] = f"Collected {result['total_collected']} failure labels from {collected_counts['namespaces_scanned']} namespaces"
+
+        elif action == "cleanup":
+            # Clean up old training data
+            deleted_data = training_store.cleanup_old_data(max_age_days=90)
+            deleted_models = model_manager.cleanup_old_models(max_age_days=30, keep_min=3)
+
+            result["cleanup_results"] = {
+                "training_data_deleted": deleted_data,
+                "models_deleted": deleted_models
+            }
+            result["message"] = f"Cleaned up {deleted_data} old data records and {deleted_models} old models"
+
+        else:
+            result["success"] = False
+            result["error"] = f"Unknown action: {action}. Valid actions: stats, list_failures, add_failure, collect, cleanup"
+
+        return result
+
+    except ImportError as e:
+        return {
+            "action": action,
+            "success": False,
+            "error": f"ML persistence module not available: {e}",
+            "message": "Install required dependencies: pip install joblib scikit-learn"
+        }
+    except Exception as e:
+        logger.error(f"Error in manage_prediction_training_data: {e}", exc_info=True)
+        return {
+            "action": action,
+            "success": False,
             "error": str(e)
         }
 

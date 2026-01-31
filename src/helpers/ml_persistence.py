@@ -26,6 +26,41 @@ logger = logging.getLogger("lumino-mcp")
 
 
 # ============================================================================
+# CLUSTER IDENTIFICATION
+# ============================================================================
+
+def get_current_cluster_id() -> str:
+    """Get the current Kubernetes cluster identifier.
+
+    Returns the cluster name from kubeconfig context, which uniquely identifies
+    the cluster. Falls back to 'unknown' if not available.
+
+    Returns:
+        Cluster identifier string (e.g., 'api-stone-prod-p02-hjvn-p1-openshiftapps-com:6443')
+    """
+    try:
+        from kubernetes import config
+        contexts, current = config.list_kube_config_contexts()
+        if current and 'context' in current:
+            cluster = current['context'].get('cluster', 'unknown')
+            return cluster
+    except Exception as e:
+        logger.debug(f"Could not get cluster ID from kubeconfig: {e}")
+
+    # Fallback: try to get from in-cluster config
+    try:
+        import os
+        # In-cluster, use the API server from environment
+        api_server = os.environ.get('KUBERNETES_SERVICE_HOST', '')
+        if api_server:
+            return f"in-cluster-{api_server}"
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+# ============================================================================
 # MODEL PERSISTENCE MANAGER
 # ============================================================================
 
@@ -319,11 +354,12 @@ class TrainingDataStore:
         conn = sqlite3.connect(str(self.db_path))
         cursor = conn.cursor()
 
-        # Log samples table
+        # Log samples table - includes cluster_id for multi-cluster support
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS log_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sample_hash TEXT UNIQUE,
+                cluster_id TEXT,
                 timestamp TEXT,
                 namespace TEXT,
                 pod_name TEXT,
@@ -336,11 +372,12 @@ class TrainingDataStore:
             )
         """)
 
-        # Failure labels table
+        # Failure labels table - includes cluster_id for multi-cluster support
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS failure_labels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 failure_id TEXT UNIQUE,
+                cluster_id TEXT,
                 failure_type TEXT,
                 severity TEXT,
                 namespace TEXT,
@@ -360,6 +397,7 @@ class TrainingDataStore:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 log_sample_id INTEGER REFERENCES log_samples(id),
                 failure_label_id INTEGER REFERENCES failure_labels(id),
+                cluster_id TEXT,
                 correlation_score REAL,
                 time_delta_seconds INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -367,11 +405,12 @@ class TrainingDataStore:
             )
         """)
 
-        # Training run history
+        # Training run history - includes cluster_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS training_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 model_id TEXT,
+                cluster_id TEXT,
                 training_started TEXT,
                 training_completed TEXT,
                 samples_used INTEGER,
@@ -385,31 +424,62 @@ class TrainingDataStore:
         # Create indexes
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_log_samples_namespace ON log_samples(namespace)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_log_samples_timestamp ON log_samples(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_log_samples_cluster ON log_samples(cluster_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_failure_labels_type ON failure_labels(failure_type)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_failure_labels_time ON failure_labels(failure_time)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_failure_labels_namespace ON failure_labels(namespace)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_failure_labels_cluster ON failure_labels(cluster_id)")
+
+        # Migration: Add cluster_id column to existing tables if not present
+        self._migrate_add_cluster_id(cursor)
 
         conn.commit()
         conn.close()
 
         logger.debug(f"Initialized training data store at {self.db_path}")
 
+    def _migrate_add_cluster_id(self, cursor: sqlite3.Cursor) -> None:
+        """Migrate existing tables to add cluster_id column if not present."""
+        tables_to_migrate = [
+            'log_samples',
+            'failure_labels',
+            'log_failure_correlations',
+            'training_runs'
+        ]
+
+        for table in tables_to_migrate:
+            try:
+                # Check if cluster_id column exists
+                cursor.execute(f"PRAGMA table_info({table})")
+                columns = [row[1] for row in cursor.fetchall()]
+
+                if 'cluster_id' not in columns:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN cluster_id TEXT")
+                    logger.info(f"Added cluster_id column to {table} table")
+            except sqlite3.Error as e:
+                logger.debug(f"Migration for {table}: {e}")
+
     def _get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
         return sqlite3.connect(str(self.db_path))
 
-    def store_log_sample(self, sample: Dict[str, Any]) -> Optional[int]:
+    def store_log_sample(self, sample: Dict[str, Any], cluster_id: Optional[str] = None) -> Optional[int]:
         """Store a preprocessed log sample.
 
         Args:
             sample: Dict with keys: timestamp, namespace, pod_name, features,
                    raw_message, log_level, error_indicators, message_entropy
+            cluster_id: Optional cluster identifier. If not provided, auto-detected.
 
         Returns:
             The sample ID or None if duplicate
         """
-        # Create hash for deduplication
-        hash_content = f"{sample.get('namespace', '')}{sample.get('raw_message', '')}"
+        # Get cluster ID if not provided
+        if cluster_id is None:
+            cluster_id = get_current_cluster_id()
+
+        # Create hash for deduplication - include cluster_id for multi-cluster support
+        hash_content = f"{cluster_id}{sample.get('namespace', '')}{sample.get('raw_message', '')}"
         sample_hash = hashlib.md5(hash_content.encode()).hexdigest()
 
         # Serialize features if present
@@ -427,11 +497,12 @@ class TrainingDataStore:
         try:
             cursor.execute("""
                 INSERT OR IGNORE INTO log_samples
-                (sample_hash, timestamp, namespace, pod_name, features,
+                (sample_hash, cluster_id, timestamp, namespace, pod_name, features,
                  raw_message, log_level, error_indicators, message_entropy)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 sample_hash,
+                cluster_id,
                 sample.get("timestamp"),
                 sample.get("namespace"),
                 sample.get("pod_name"),
@@ -450,21 +521,26 @@ class TrainingDataStore:
         finally:
             conn.close()
 
-    def store_failure_label(self, label: Dict[str, Any]) -> Optional[int]:
+    def store_failure_label(self, label: Dict[str, Any], cluster_id: Optional[str] = None) -> Optional[int]:
         """Store a failure label.
 
         Args:
             label: Dict with keys: failure_id, failure_type, severity, namespace,
                   resource_name, resource_type, failure_time, detection_source,
                   error_category, metadata
+            cluster_id: Optional cluster identifier. If not provided, auto-detected.
 
         Returns:
             The label ID or None if duplicate
         """
-        # Generate failure_id if not provided
+        # Get cluster ID if not provided
+        if cluster_id is None:
+            cluster_id = get_current_cluster_id()
+
+        # Generate failure_id if not provided - include cluster_id for uniqueness
         failure_id = label.get("failure_id")
         if not failure_id:
-            id_content = f"{label.get('namespace', '')}{label.get('resource_name', '')}{label.get('failure_time', '')}"
+            id_content = f"{cluster_id}{label.get('namespace', '')}{label.get('resource_name', '')}{label.get('failure_time', '')}"
             failure_id = hashlib.md5(id_content.encode()).hexdigest()
 
         # Serialize metadata
@@ -478,11 +554,12 @@ class TrainingDataStore:
         try:
             cursor.execute("""
                 INSERT OR IGNORE INTO failure_labels
-                (failure_id, failure_type, severity, namespace, resource_name,
+                (failure_id, cluster_id, failure_type, severity, namespace, resource_name,
                  resource_type, failure_time, detection_source, error_category, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 failure_id,
+                cluster_id,
                 label.get("failure_type"),
                 label.get("severity"),
                 label.get("namespace"),
@@ -533,7 +610,9 @@ class TrainingDataStore:
         start_time: datetime,
         end_time: datetime,
         failure_types: Optional[List[str]] = None,
-        namespace: Optional[str] = None
+        namespace: Optional[str] = None,
+        cluster_id: Optional[str] = None,
+        current_cluster_only: bool = True
     ) -> List[Dict[str, Any]]:
         """Get failure labels within a time window.
 
@@ -542,6 +621,8 @@ class TrainingDataStore:
             end_time: Window end
             failure_types: Optional filter for failure types
             namespace: Optional filter for namespace
+            cluster_id: Optional specific cluster to query
+            current_cluster_only: If True, only return labels from current cluster (default)
 
         Returns:
             List of failure label dicts
@@ -550,12 +631,22 @@ class TrainingDataStore:
         cursor = conn.cursor()
 
         query = """
-            SELECT id, failure_id, failure_type, severity, namespace, resource_name,
+            SELECT id, failure_id, cluster_id, failure_type, severity, namespace, resource_name,
                    resource_type, failure_time, detection_source, error_category, metadata
             FROM failure_labels
             WHERE failure_time >= ? AND failure_time <= ?
         """
         params = [start_time.isoformat(), end_time.isoformat()]
+
+        # Filter by cluster
+        if cluster_id:
+            query += " AND cluster_id = ?"
+            params.append(cluster_id)
+        elif current_cluster_only:
+            current = get_current_cluster_id()
+            # Include both current cluster and legacy data without cluster_id
+            query += " AND (cluster_id = ? OR cluster_id IS NULL)"
+            params.append(current)
 
         if failure_types:
             placeholders = ",".join("?" * len(failure_types))
@@ -575,23 +666,24 @@ class TrainingDataStore:
         labels = []
         for row in rows:
             metadata = None
-            if row[10]:
+            if row[11]:
                 try:
-                    metadata = json.loads(row[10])
+                    metadata = json.loads(row[11])
                 except json.JSONDecodeError:
                     metadata = {}
 
             labels.append({
                 "id": row[0],
                 "failure_id": row[1],
-                "failure_type": row[2],
-                "severity": row[3],
-                "namespace": row[4],
-                "resource_name": row[5],
-                "resource_type": row[6],
-                "failure_time": row[7],
-                "detection_source": row[8],
-                "error_category": row[9],
+                "cluster_id": row[2],
+                "failure_type": row[3],
+                "severity": row[4],
+                "namespace": row[5],
+                "resource_name": row[6],
+                "resource_type": row[7],
+                "failure_time": row[8],
+                "detection_source": row[9],
+                "error_category": row[10],
                 "metadata": metadata
             })
 
@@ -668,32 +760,54 @@ class TrainingDataStore:
 
         return samples, total_count
 
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get statistics about stored training data."""
+    def get_statistics(self, current_cluster_only: bool = False) -> Dict[str, Any]:
+        """Get statistics about stored training data.
+
+        Args:
+            current_cluster_only: If True, only count data from current cluster
+
+        Returns:
+            Dict with statistics
+        """
         conn = self._get_connection()
         cursor = conn.cursor()
 
         stats = {}
+        current_cluster = get_current_cluster_id()
+        stats["current_cluster"] = current_cluster
+
+        # Build cluster filter
+        cluster_filter = ""
+        if current_cluster_only:
+            cluster_filter = f" WHERE (cluster_id = '{current_cluster}' OR cluster_id IS NULL)"
 
         # Log samples stats
-        cursor.execute("SELECT COUNT(*) FROM log_samples")
+        cursor.execute(f"SELECT COUNT(*) FROM log_samples{cluster_filter}")
         stats["total_log_samples"] = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(DISTINCT namespace) FROM log_samples")
+        cursor.execute(f"SELECT COUNT(DISTINCT namespace) FROM log_samples{cluster_filter}")
         stats["unique_namespaces"] = cursor.fetchone()[0]
 
+        # Cluster distribution for log samples
+        cursor.execute("SELECT cluster_id, COUNT(*) FROM log_samples GROUP BY cluster_id")
+        stats["log_samples_by_cluster"] = {(k or "legacy"): v for k, v in cursor.fetchall()}
+
         # Failure labels stats
-        cursor.execute("SELECT COUNT(*) FROM failure_labels")
+        cursor.execute(f"SELECT COUNT(*) FROM failure_labels{cluster_filter}")
         stats["total_failure_labels"] = cursor.fetchone()[0]
 
-        cursor.execute("SELECT failure_type, COUNT(*) FROM failure_labels GROUP BY failure_type")
+        cursor.execute(f"SELECT failure_type, COUNT(*) FROM failure_labels{cluster_filter.replace('WHERE', 'WHERE 1=1 AND') if cluster_filter else ''} GROUP BY failure_type")
         stats["failure_types"] = dict(cursor.fetchall())
 
-        cursor.execute("SELECT severity, COUNT(*) FROM failure_labels GROUP BY severity")
+        cursor.execute(f"SELECT severity, COUNT(*) FROM failure_labels{cluster_filter.replace('WHERE', 'WHERE 1=1 AND') if cluster_filter else ''} GROUP BY severity")
         stats["severity_distribution"] = dict(cursor.fetchall())
 
+        # Cluster distribution for failure labels
+        cursor.execute("SELECT cluster_id, COUNT(*) FROM failure_labels GROUP BY cluster_id")
+        stats["failure_labels_by_cluster"] = {(k or "legacy"): v for k, v in cursor.fetchall()}
+
         # Correlations
-        cursor.execute("SELECT COUNT(*) FROM log_failure_correlations")
+        cursor.execute(f"SELECT COUNT(*) FROM log_failure_correlations")
         stats["total_correlations"] = cursor.fetchone()[0]
 
         # Training runs
