@@ -319,27 +319,27 @@ OPENSHIFT_PROMETHEUS_ENDPOINTS = {
 # ============================================================================
 
 class PrometheusEndpointCache:
-    """Cache for discovered Prometheus endpoints with TTL."""
+    """Cache for discovered Prometheus/Thanos endpoints with TTL."""
 
     def __init__(self, ttl_seconds: int = 300):  # 5 minute default cache
-        self._cache: Dict[str, tuple] = {}  # key -> (endpoint, timestamp)
+        self._cache: Dict[str, tuple] = {}  # key -> (endpoint, endpoint_type, timestamp)
         self._ttl = ttl_seconds
 
-    def get(self, cluster_key: str = "default") -> Optional[str]:
-        """Get cached endpoint if valid."""
+    def get(self, cluster_key: str = "default") -> Optional[tuple]:
+        """Get cached endpoint if valid. Returns (url, endpoint_type) or None."""
         if cluster_key in self._cache:
-            endpoint, timestamp = self._cache[cluster_key]
+            endpoint, endpoint_type, timestamp = self._cache[cluster_key]
             if time.time() - timestamp < self._ttl:
-                logger.debug(f"Cache hit for Prometheus endpoint: {endpoint}")
-                return endpoint
+                logger.debug(f"Cache hit for {endpoint_type} endpoint: {endpoint}")
+                return (endpoint, endpoint_type)
             else:
                 del self._cache[cluster_key]
         return None
 
-    def set(self, endpoint: str, cluster_key: str = "default") -> None:
-        """Cache endpoint."""
-        self._cache[cluster_key] = (endpoint, time.time())
-        logger.debug(f"Cached Prometheus endpoint: {endpoint}")
+    def set(self, endpoint: str, cluster_key: str = "default", endpoint_type: str = "prometheus") -> None:
+        """Cache endpoint with its type."""
+        self._cache[cluster_key] = (endpoint, endpoint_type, time.time())
+        logger.debug(f"Cached {endpoint_type} endpoint: {endpoint}")
 
     def invalidate(self, cluster_key: str = "default") -> None:
         """Invalidate cache entry."""
@@ -4144,8 +4144,8 @@ async def _discover_prometheus_via_routes() -> Optional[str]:
             plural="routes"
         )
 
-        # Priority order for Prometheus routes
-        preferred_routes = ["prometheus-k8s", "thanos-querier"]
+        # Priority order: prefer Thanos (unified, deduplicated view) over direct Prometheus
+        preferred_routes = ["thanos-querier", "prometheus-k8s"]
 
         route_items = routes.get("items", [])
         route_map = {r.get("metadata", {}).get("name"): r for r in route_items}
@@ -4366,79 +4366,202 @@ async def _discover_prometheus_via_services() -> Optional[str]:
     return None
 
 
-async def _discover_prometheus_endpoint(cluster_override: Optional[str] = None) -> Optional[str]:
+async def _discover_thanos_via_services() -> Optional[str]:
     """
-    Discover Prometheus endpoint using multiple strategies.
+    Discover Thanos Query endpoint by searching for Thanos services.
 
-    Priority order depends on runtime environment:
-    - In-cluster: Services -> CRD -> Routes (prefer internal URLs)
-    - Local: Routes -> CRD -> Services (prefer external URLs)
+    Thanos Query implements the Prometheus HTTP API, so once discovered
+    it can be used interchangeably with Prometheus for PromQL queries.
+
+    Search criteria:
+    - Services with 'thanos-query' or 'thanos-querier' in name
+    - Services with Thanos-related labels
+    - Common Thanos Query ports: 9090, 10902 (HTTP), 9091
+    """
+    if not k8s_core_api:
+        logger.debug("CoreV1Api not available for Thanos service discovery")
+        return None
+
+    try:
+        monitoring_namespaces = [
+            "openshift-monitoring",
+            "monitoring",
+            "thanos",
+            "observability",
+            "kube-prometheus",
+        ]
+
+        priority_names = ["thanos-query-frontend", "thanos-querier", "thanos-query"]
+        thanos_http_ports = [9090, 9091, 80, 443]
+
+        # First pass: check known monitoring namespaces for priority service names
+        for namespace in monitoring_namespaces:
+            try:
+                services = k8s_core_api.list_namespaced_service(namespace=namespace)
+
+                for priority_name in priority_names:
+                    for service in services.items:
+                        if service.metadata.name == priority_name:
+                            ports = service.spec.ports or []
+                            port = 9090
+                            for p in ports:
+                                if p.port in thanos_http_ports or (p.name and p.name in ["http", "web", "https"]):
+                                    port = p.port
+                                    break
+                            endpoint = f"http://{priority_name}.{namespace}.svc.cluster.local:{port}"
+                            logger.info(f"Discovered Thanos Query service (priority match): {endpoint}")
+                            return endpoint
+
+                # Second pass: any service with 'thanos' and 'query' in the name
+                for service in services.items:
+                    name = service.metadata.name.lower()
+                    if "thanos" in name and ("query" in name or "querier" in name):
+                        ports = service.spec.ports or []
+                        port = 9090
+                        for p in ports:
+                            if p.port in thanos_http_ports or (p.name and p.name in ["http", "web", "https"]):
+                                port = p.port
+                                break
+                        endpoint = f"http://{service.metadata.name}.{namespace}.svc.cluster.local:{port}"
+                        logger.info(f"Discovered Thanos Query service: {endpoint}")
+                        return endpoint
+
+            except client.rest.ApiException as e:
+                if e.status != 404:
+                    logger.debug(f"Namespace '{namespace}' not accessible for Thanos discovery: {e}")
+                continue
+
+        # Cluster-wide label-based search
+        label_selectors = [
+            "app.kubernetes.io/name=thanos-query",
+            "app.kubernetes.io/component=query,app.kubernetes.io/name=thanos",
+            "app=thanos-query",
+            "app=thanos-querier",
+        ]
+
+        for label_selector in label_selectors:
+            try:
+                services = k8s_core_api.list_service_for_all_namespaces(
+                    label_selector=label_selector
+                )
+                if services.items:
+                    service = services.items[0]
+                    name = service.metadata.name
+                    namespace = service.metadata.namespace
+                    ports = service.spec.ports or []
+                    port = 9090
+                    for p in ports:
+                        if p.port in thanos_http_ports or (p.name and p.name in ["http", "web"]):
+                            port = p.port
+                            break
+                    endpoint = f"http://{name}.{namespace}.svc.cluster.local:{port}"
+                    logger.info(f"Discovered Thanos Query via label selector '{label_selector}': {endpoint}")
+                    return endpoint
+
+            except client.rest.ApiException as e:
+                logger.debug(f"Error with Thanos label selector '{label_selector}': {e}")
+                continue
+
+    except Exception as e:
+        logger.warning(f"Error discovering Thanos Query via services: {e}")
+
+    return None
+
+
+async def _discover_prometheus_endpoint(cluster_override: Optional[str] = None) -> tuple:
+    """
+    Discover Prometheus or Thanos Query endpoint using multiple strategies.
+
+    Returns a (url, endpoint_type) tuple where endpoint_type is "thanos" or "prometheus".
+    Thanos Query is preferred when available since it provides a unified, deduplicated view.
+
+    Priority order:
+    0. THANOS_URL env var (explicit Thanos override)
+    1. PROMETHEUS_URL env var (explicit Prometheus override)
+    2. Predefined cluster endpoints
+    3. Cache
+    4. Auto-discovery (Thanos first, then Prometheus)
+    5. Predefined fallback endpoints
 
     Args:
         cluster_override: Optional cluster name for predefined endpoint lookup
 
     Returns:
-        Prometheus endpoint URL or None if not found
+        (endpoint_url, endpoint_type) tuple, or (None, None) if not found
     """
-    # 0. Check for PROMETHEUS_URL environment variable (highest priority)
+    # 0. Check for THANOS_URL environment variable (highest priority)
+    env_thanos_url = os.getenv("THANOS_URL")
+    if env_thanos_url:
+        logger.info(f"Using Thanos endpoint from THANOS_URL environment variable: {env_thanos_url}")
+        return (env_thanos_url, "thanos")
+
+    # 1. Check for PROMETHEUS_URL environment variable
     env_prometheus_url = os.getenv("PROMETHEUS_URL")
     if env_prometheus_url:
         logger.info(f"Using Prometheus endpoint from PROMETHEUS_URL environment variable: {env_prometheus_url}")
-        return env_prometheus_url
+        return (env_prometheus_url, "prometheus")
 
-    # 1. Check for cluster override in predefined endpoints
+    # 2. Check for cluster override in predefined endpoints
     if cluster_override and cluster_override in OPENSHIFT_PROMETHEUS_ENDPOINTS:
         endpoint = OPENSHIFT_PROMETHEUS_ENDPOINTS[cluster_override].get("url")
         if endpoint:
-            logger.info(f"Using predefined endpoint for cluster '{cluster_override}': {endpoint}")
-            return endpoint
+            endpoint_type = OPENSHIFT_PROMETHEUS_ENDPOINTS[cluster_override].get("type", "prometheus")
+            logger.info(f"Using predefined {endpoint_type} endpoint for cluster '{cluster_override}': {endpoint}")
+            return (endpoint, endpoint_type)
 
-    # 2. Check cache
+    # 3. Check cache (now returns (url, type) tuple or None)
     cache_key = cluster_override or "default"
-    cached_endpoint = _prometheus_endpoint_cache.get(cache_key)
-    if cached_endpoint:
-        logger.info(f"Using cached Prometheus endpoint: {cached_endpoint}")
-        return cached_endpoint
+    cached = _prometheus_endpoint_cache.get(cache_key)
+    if cached:
+        logger.info(f"Using cached {cached[1]} endpoint: {cached[0]}")
+        return cached
 
-    # 3. Discovery chain - order depends on runtime environment
+    # 4. Discovery chain - order depends on runtime environment
+    # Thanos discovery comes first: if Thanos is deployed, it's the intended query interface.
+    # Each entry: (method_name, discovery_func, endpoint_type)
     if _is_running_in_cluster():
-        # In-cluster: prefer internal service URLs
         discovery_methods = [
-            ("Service Discovery", _discover_prometheus_via_services),
-            ("Prometheus Operator CRD", _discover_prometheus_via_operator_crd),
-            ("OpenShift Routes", _discover_prometheus_via_routes),
+            ("Thanos Query Services", _discover_thanos_via_services, "thanos"),
+            ("Prometheus Services", _discover_prometheus_via_services, "prometheus"),
+            ("Prometheus Operator CRD", _discover_prometheus_via_operator_crd, "prometheus"),
+            ("OpenShift Routes", _discover_prometheus_via_routes, None),  # type detected from route name
         ]
     else:
-        # Local development: prefer external URLs (Routes) that resolve locally
         discovery_methods = [
-            ("OpenShift Routes", _discover_prometheus_via_routes),
-            ("Prometheus Operator CRD", _discover_prometheus_via_operator_crd),
-            ("Service Discovery", _discover_prometheus_via_services),
+            ("OpenShift Routes", _discover_prometheus_via_routes, None),  # type detected from route name
+            ("Thanos Query Services", _discover_thanos_via_services, "thanos"),
+            ("Prometheus Operator CRD", _discover_prometheus_via_operator_crd, "prometheus"),
+            ("Prometheus Services", _discover_prometheus_via_services, "prometheus"),
         ]
 
-    for method_name, discovery_func in discovery_methods:
+    for method_name, discovery_func, method_type in discovery_methods:
         try:
-            logger.debug(f"Attempting Prometheus discovery via: {method_name}")
+            logger.debug(f"Attempting discovery via: {method_name}")
             endpoint = await discovery_func()
             if endpoint:
-                # Cache the discovered endpoint
-                _prometheus_endpoint_cache.set(endpoint, cache_key)
-                return endpoint
+                # For OpenShift Routes, detect type from the discovered endpoint/route name
+                if method_type is None:
+                    endpoint_type = "thanos" if "thanos" in endpoint.lower() else "prometheus"
+                else:
+                    endpoint_type = method_type
+                _prometheus_endpoint_cache.set(endpoint, cache_key, endpoint_type=endpoint_type)
+                return (endpoint, endpoint_type)
         except Exception as e:
             logger.warning(f"Discovery method '{method_name}' failed: {e}")
             continue
 
-    # 4. Fallback to predefined endpoints (try all except 'local')
+    # 5. Fallback to predefined endpoints (try all except 'local')
     for cluster_name, config in OPENSHIFT_PROMETHEUS_ENDPOINTS.items():
         if cluster_name != "local":
             endpoint = config.get("url")
             if endpoint:
-                logger.info(f"Using fallback Prometheus endpoint: {endpoint}")
-                _prometheus_endpoint_cache.set(endpoint, cache_key)
-                return endpoint
+                endpoint_type = config.get("type", "prometheus")
+                logger.info(f"Using fallback {endpoint_type} endpoint: {endpoint}")
+                _prometheus_endpoint_cache.set(endpoint, cache_key, endpoint_type=endpoint_type)
+                return (endpoint, endpoint_type)
 
-    logger.error("Could not discover Prometheus endpoint via any method")
-    return None
+    logger.error("Could not discover Prometheus/Thanos endpoint via any method")
+    return (None, None)
 
 
 def _parse_time_parameter(time_param: str) -> str:
@@ -4474,25 +4597,30 @@ async def _execute_prometheus_query_internal(
     timeout: int = 30
 ) -> Dict[str, Any]:
     """
-    Internal helper to execute Prometheus queries from within other tools.
+    Internal helper to execute Prometheus/Thanos queries from within other tools.
 
     Args:
         query: PromQL query string
         timeout: Query timeout in seconds
 
     Returns:
-        Dict with 'success', 'data' (list of results), and 'error' if failed
+        Dict with 'success', 'data' (list of results), 'endpoint_type', and 'error' if failed
     """
     try:
-        prometheus_url = await _discover_prometheus_endpoint()
+        prometheus_url, endpoint_type = await _discover_prometheus_endpoint()
         if not prometheus_url:
-            return {"success": False, "data": [], "error": "Could not discover Prometheus endpoint"}
+            return {"success": False, "data": [], "error": "Could not discover Prometheus/Thanos endpoint"}
 
         # Get authentication token
         auth_token = await _get_k8s_bearer_token()
 
         api_path = "/api/v1/query"
         params = {"query": query, "timeout": f"{timeout}s"}
+
+        # Add Thanos-specific parameters for deduplicated results
+        if endpoint_type == "thanos":
+            params["dedup"] = "true"
+
         query_url = f"{prometheus_url}{api_path}"
 
         headers = {
@@ -4509,11 +4637,11 @@ async def _execute_prometheus_query_internal(
                     response_data = await response.json()
                     result_data = response_data.get("data", {})
                     raw_results = result_data.get("result", [])
-                    return {"success": True, "data": raw_results, "error": None}
+                    return {"success": True, "data": raw_results, "endpoint_type": endpoint_type, "error": None}
                 else:
                     error_text = await response.text()
                     logger.warning(f"Prometheus query failed with status {response.status}: {error_text}")
-                    return {"success": False, "data": [], "error": f"HTTP {response.status}: {error_text}"}
+                    return {"success": False, "data": [], "endpoint_type": endpoint_type, "error": f"HTTP {response.status}: {error_text}"}
 
     except Exception as e:
         logger.error(f"Error executing internal Prometheus query: {e}")
@@ -5078,8 +5206,8 @@ async def prometheus_query(
         if not auth_token:
             logger.info(f"[{tool_name}] No bearer token available - will attempt unauthenticated request (common for vanilla Kubernetes Prometheus)")
 
-        # Discover or use Prometheus endpoint
-        prometheus_url = await _discover_prometheus_endpoint(cluster)
+        # Discover or use Prometheus/Thanos endpoint
+        prometheus_url, endpoint_type = await _discover_prometheus_endpoint(cluster)
         if not prometheus_url:
             return {
                 "status": "error",
@@ -5090,15 +5218,16 @@ async def prometheus_query(
                 "result_count": 0,
                 "data": [],
                 "suggestions": [
-                    "Check if Prometheus is deployed (openshift-monitoring, monitoring, or prometheus namespace)",
+                    "Check if Prometheus or Thanos Query is deployed (openshift-monitoring, monitoring, thanos, or observability namespace)",
                     "Verify Prometheus Operator CRDs are installed if using Prometheus Operator",
                     "Ensure OpenShift Routes are accessible if on OpenShift",
+                    "Set THANOS_URL or PROMETHEUS_URL environment variable to specify endpoint directly",
                     "Try adding a predefined endpoint in OPENSHIFT_PROMETHEUS_ENDPOINTS config"
                 ],
-                "errors": ["Prometheus endpoint not found"]
+                "errors": ["Prometheus/Thanos endpoint not found"]
             }
 
-        logger.info(f"[{tool_name}] Using Prometheus endpoint: {prometheus_url}")
+        logger.info(f"[{tool_name}] Using {endpoint_type} endpoint: {prometheus_url}")
 
         # Build query URL and parameters
         if query_type == "instant":
@@ -5116,6 +5245,10 @@ async def prometheus_query(
             }
             if timeout:
                 params["timeout"] = f"{timeout}s"
+
+        # Add Thanos-specific parameters for deduplicated, consistent results
+        if endpoint_type == "thanos":
+            params["dedup"] = "true"
 
         query_url = f"{prometheus_url}{api_path}"
         headers = {
@@ -5148,6 +5281,7 @@ async def prometheus_query(
                         "query_executed": query,
                         "execution_time": execution_time,
                         "prometheus_endpoint": prometheus_url,
+                        "endpoint_type": endpoint_type,
                         "query_type": query_type,
                         "parameters": params
                     })
