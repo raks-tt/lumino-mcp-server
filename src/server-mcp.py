@@ -883,11 +883,14 @@ async def list_taskruns(namespace: str, pipeline_run: Optional[str] = None) -> L
         logger.info(f"Retrieving TaskRuns from namespace: {namespace}" +
                    (f" (filtered by PipelineRun: {pipeline_run})" if pipeline_run else ""))
 
+        label_selector = f"tekton.dev/pipelineRun={pipeline_run}" if pipeline_run else None
+
         task_runs = k8s_custom_api.list_namespaced_custom_object(
             group="tekton.dev",
             version="v1",
             namespace=namespace,
-            plural="taskruns"
+            plural="taskruns",
+            label_selector=label_selector
         )
 
         result = []
