@@ -717,12 +717,13 @@ async def detect_tekton_namespaces() -> Dict[str, List[str]]:
 
 
 @mcp.tool()
-async def list_pipelineruns(namespace: str) -> List[Dict[str, Any]]:
+async def list_pipelineruns(namespace: str, limit: Optional[int] = 200) -> List[Dict[str, Any]]:
     """
     List Tekton PipelineRuns in a namespace with status and timing details.
 
     Args:
         namespace: Kubernetes namespace to query.
+        limit: Maximum number of PipelineRuns to return (default: 200). Set to 0 for no limit.
 
     Returns:
         List[Dict]: PipelineRuns with keys: name, pipeline, status, started_at, completed_at, duration.
@@ -738,12 +739,16 @@ async def list_pipelineruns(namespace: str) -> List[Dict[str, Any]]:
             return [{"error": error_msg}]
 
         # Query Tekton PipelineRuns using Kubernetes Custom Resource API
-        pipeline_runs = k8s_custom_api.list_namespaced_custom_object(
-            group="tekton.dev",
-            version="v1",
-            namespace=namespace,
-            plural="pipelineruns"
-        )
+        list_kwargs = {
+            "group": "tekton.dev",
+            "version": "v1",
+            "namespace": namespace,
+            "plural": "pipelineruns",
+        }
+        if limit:
+            list_kwargs["limit"] = limit
+
+        pipeline_runs = k8s_custom_api.list_namespaced_custom_object(**list_kwargs)
 
         pipeline_run_items = pipeline_runs.get("items", [])
         logger.info(f"Found {len(pipeline_run_items)} PipelineRuns in namespace '{namespace}'")
@@ -10136,7 +10141,8 @@ async def _process_namespace_topology(
                     group="tekton.dev",
                     version="v1",
                     namespace=namespace,
-                    plural="pipelineruns"
+                    plural="pipelineruns",
+                    limit=200
                 )
 
                 for pr in pipeline_runs.get("items", []):
@@ -10217,7 +10223,8 @@ async def _process_namespace_topology(
                     group="tekton.dev",
                     version="v1",
                     namespace=namespace,
-                    plural="taskruns"
+                    plural="taskruns",
+                    limit=500
                 )
                 permissions["accessible"].append(f"{cluster_name}/{namespace}/taskruns")
 

@@ -71,9 +71,10 @@ async def correlate_pipeline_events(
         try:
             pipeline_runs = custom_api.list_namespaced_custom_object(
                 group="tekton.dev",
-                version="v1beta1",
+                version="v1",
                 namespace=namespace,
-                plural="pipelineruns"
+                plural="pipelineruns",
+                limit=200
             )
 
             for pr in pipeline_runs.get("items", []):
