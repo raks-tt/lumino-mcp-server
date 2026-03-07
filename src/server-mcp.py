@@ -885,13 +885,21 @@ async def list_taskruns(namespace: str, pipeline_run: Optional[str] = None) -> L
 
         label_selector = f"tekton.dev/pipelineRun={pipeline_run}" if pipeline_run else None
 
-        task_runs = k8s_custom_api.list_namespaced_custom_object(
-            group="tekton.dev",
-            version="v1",
-            namespace=namespace,
-            plural="taskruns",
-            label_selector=label_selector
-        )
+        # When filtering by pipeline_run, the label_selector narrows the result set
+        # so no limit is needed. Without a filter, limit to prevent fetching all
+        # TaskRuns in large namespaces (can be 2000+ objects, ~97MB response).
+        list_kwargs = {
+            "group": "tekton.dev",
+            "version": "v1",
+            "namespace": namespace,
+            "plural": "taskruns",
+        }
+        if label_selector:
+            list_kwargs["label_selector"] = label_selector
+        else:
+            list_kwargs["limit"] = 200
+
+        task_runs = k8s_custom_api.list_namespaced_custom_object(**list_kwargs)
 
         result = []
         for tr in task_runs.get("items", []):
@@ -3053,11 +3061,13 @@ async def find_pipeline(
 
         def fetch_pipelineruns_cluster():
             try:
+                # Cap at 200 to avoid multi-MB responses causing IncompleteRead
+                safe_limit = min(pipeline_runs_limit, 200)
                 return k8s_custom_api.list_cluster_custom_object(
                     group="tekton.dev",
                     version="v1",
                     plural="pipelineruns",
-                    limit=pipeline_runs_limit
+                    limit=safe_limit
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -3076,11 +3086,14 @@ async def find_pipeline(
 
         def fetch_taskruns_cluster():
             try:
+                # Cap at 100 -- cluster-wide TaskRun LIST is the most expensive
+                # call (~97MB response). Prefer namespace-scoped queries instead.
+                safe_limit = min(task_runs_limit, 100)
                 return k8s_custom_api.list_cluster_custom_object(
                     group="tekton.dev",
                     version="v1",
                     plural="taskruns",
-                    limit=task_runs_limit
+                    limit=safe_limit
                 )
             except ApiException as e:
                 return {"error": str(e), "items": []}
@@ -3293,32 +3306,65 @@ async def get_tekton_pipeline_runs_status(
     try:
         logger.info("Fetching cluster-wide Tekton PipelineRuns and TaskRuns status")
 
-        # Use limits to prevent timeout on large clusters
-        # Fetch PipelineRuns cluster-wide with limit
-        pipeline_runs = k8s_custom_api.list_cluster_custom_object(
-            group="tekton.dev",
-            version="v1",
-            plural="pipelineruns",
-            limit=pipeline_runs_limit
-        )
+        # Cap the limit to avoid massive responses that cause IncompleteRead errors.
+        # Cluster-wide LIST on pipelineruns can return multi-MB responses.
+        safe_pr_limit = min(pipeline_runs_limit, 200)
 
-        # For TaskRuns, only fetch from namespaces with active pipelines to avoid massive data
-        # Get unique namespaces from PipelineRuns
+        # First, get namespaces with Tekton activity to scope queries
+        # Fetch PipelineRuns per-namespace for reliability on large clusters
+        all_namespaces = []
+        try:
+            ns_list = k8s_core_api.list_namespace(label_selector="toolchain.dev.openshift.com/type=tenant")
+            all_namespaces = [ns.metadata.name for ns in ns_list.items]
+            logger.info(f"Found {len(all_namespaces)} tenant namespaces")
+        except Exception:
+            # Fallback: cluster-wide query with safe limit
+            logger.info("Namespace label selector failed, falling back to cluster-wide query")
+
+        pipeline_runs_items = []
         active_namespaces = set()
-        for pr in pipeline_runs.get('items', []):
-            ns = pr.get('metadata', {}).get('namespace')
-            if ns:
-                active_namespaces.add(ns)
+
+        if all_namespaces:
+            # Per-namespace fetch with limit -- avoids 97MB cluster-wide responses
+            per_ns_limit = max(5, safe_pr_limit // min(len(all_namespaces), max_namespaces))
+            for ns in all_namespaces[:max_namespaces * 2]:
+                try:
+                    ns_prs = k8s_custom_api.list_namespaced_custom_object(
+                        group="tekton.dev", version="v1",
+                        namespace=ns, plural="pipelineruns",
+                        limit=per_ns_limit
+                    )
+                    items = ns_prs.get('items', [])
+                    if items:
+                        pipeline_runs_items.extend(items)
+                        active_namespaces.add(ns)
+                except Exception as e:
+                    logger.debug(f"Error fetching PipelineRuns from {ns}: {e}")
+                    continue
+                if len(pipeline_runs_items) >= safe_pr_limit:
+                    break
+            pipeline_runs_items = pipeline_runs_items[:safe_pr_limit]
+        else:
+            # Fallback: cluster-wide with safe limit
+            pipeline_runs = k8s_custom_api.list_cluster_custom_object(
+                group="tekton.dev", version="v1",
+                plural="pipelineruns", limit=safe_pr_limit
+            )
+            pipeline_runs_items = pipeline_runs.get('items', [])
+            for pr in pipeline_runs_items:
+                ns = pr.get('metadata', {}).get('namespace')
+                if ns:
+                    active_namespaces.add(ns)
+
+        pipeline_runs = {'items': pipeline_runs_items}
 
         # Fetch TaskRuns only from active namespaces with limits
         task_runs_items = []
         for ns in list(active_namespaces)[:max_namespaces]:
             try:
                 ns_task_runs = k8s_custom_api.list_namespaced_custom_object(
-                    group="tekton.dev",
-                    version="v1",
-                    namespace=ns,
-                    plural="taskruns",
+                    group="tekton.dev", version="v1",
+                    namespace=ns, plural="taskruns",
                     limit=task_runs_limit_per_namespace
                 )
                 task_runs_items.extend(ns_task_runs.get('items', []))
