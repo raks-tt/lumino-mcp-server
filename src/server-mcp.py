@@ -11466,21 +11466,36 @@ async def resource_bottleneck_forecaster(
 
             if namespaces:
                 # When specific namespaces are requested, limit node output to prevent
-                # bloated responses (56+ nodes * 3 resource types = 168+ entries).
-                # Keep: nodes approaching exhaustion + top-N most utilized nodes.
-                MAX_NODE_FORECASTS = 20
+                # bloated responses (56+ nodes * 3 resource types * mountpoints = 200+ entries).
+                # Strategy: keep top 5 nodes by max utilization across all resource types.
+                MAX_NODES = 5
 
-                critical = [f for f in node_forecasts if f.get('predicted_exhaustion')]
-                normal = [f for f in node_forecasts if not f.get('predicted_exhaustion')]
-                normal.sort(key=lambda f: f.get('current_usage', {}).get('value', 0), reverse=True)
+                # Group forecasts by node
+                node_max_usage = {}
+                node_has_exhaustion = {}
+                for f in node_forecasts:
+                    node = f.get('resource_identifier', {}).get('node', f.get('resource_identifier', {}).get('instance', 'unknown'))
+                    usage = f.get('current_usage', {}).get('value', 0)
+                    node_max_usage[node] = max(node_max_usage.get(node, 0), usage)
+                    if f.get('predicted_exhaustion'):
+                        node_has_exhaustion[node] = True
 
-                remaining_slots = max(0, MAX_NODE_FORECASTS - len(critical))
-                forecasts.extend(critical)
-                forecasts.extend(normal[:remaining_slots])
+                # Select top nodes: exhaustion-approaching first, then highest utilization
+                sorted_nodes = sorted(
+                    node_max_usage.keys(),
+                    key=lambda n: (node_has_exhaustion.get(n, False), node_max_usage[n]),
+                    reverse=True
+                )
+                keep_nodes = set(sorted_nodes[:MAX_NODES])
 
-                if len(node_forecasts) > MAX_NODE_FORECASTS:
-                    logger.info(f"Trimmed node forecasts from {len(node_forecasts)} to {len(forecasts)} "
-                                f"({len(critical)} critical + {remaining_slots} top utilized)")
+                # Filter forecasts to only keep selected nodes
+                trimmed = [f for f in node_forecasts
+                           if f.get('resource_identifier', {}).get('node', f.get('resource_identifier', {}).get('instance', '')) in keep_nodes]
+                forecasts.extend(trimmed)
+
+                if len(node_forecasts) > len(trimmed):
+                    logger.info(f"Trimmed node forecasts from {len(node_forecasts)} entries ({len(node_max_usage)} nodes) "
+                                f"to {len(trimmed)} entries ({len(keep_nodes)} nodes)")
             else:
                 forecasts.extend(node_forecasts)
 

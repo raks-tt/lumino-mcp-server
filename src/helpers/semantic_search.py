@@ -516,18 +516,33 @@ def _group_similar_results(results: List[Dict[str, Any]]) -> List[List[Dict[str,
     return groups
 
 
+def _get_result_content(result: Dict[str, Any]) -> str:
+    """Extract the text content from a search result for comparison."""
+    # Check nested log_entry.message first (standard structure from _search_pod_logs_semantically)
+    log_entry = result.get('log_entry', {})
+    if isinstance(log_entry, dict) and log_entry.get('message'):
+        return str(log_entry['message'])
+    # Fall back to top-level content
+    return result.get('content', '')
+
+
+def _get_result_source_key(result: Dict[str, Any]) -> str:
+    """Build a comparable string key from a result's source metadata."""
+    source = result.get('source', {})
+    if isinstance(source, dict):
+        return f"{source.get('type', '')}:{source.get('namespace', '')}:{source.get('pod_name', '')}"
+    return str(source)
+
+
 def _are_results_similar(result1: Dict[str, Any], result2: Dict[str, Any]) -> bool:
     """Check if two results are similar enough to group together."""
-    # Check if they're from the same source
-    source1 = result1.get('source', '')
-    source2 = result2.get('source', '')
-
-    if source1 != source2:
+    # Check if they're from the same source (namespace + pod)
+    if _get_result_source_key(result1) != _get_result_source_key(result2):
         return False
 
-    # Check content similarity (simplified)
-    content1 = result1.get('content', '').lower()
-    content2 = result2.get('content', '').lower()
+    # Extract content from the correct field
+    content1 = _get_result_content(result1).lower()
+    content2 = _get_result_content(result2).lower()
 
     # Simple similarity check based on common words
     words1 = set(content1.split())
