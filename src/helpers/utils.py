@@ -856,6 +856,28 @@ def detect_anomalies_in_data(data_points: List[float], original_data: List[Any])
 # ============================================================================
 
 
+def _normalize_log_newlines(log_text: str) -> str:
+    """Normalize log text by converting literal backslash-n sequences to actual newlines.
+
+    When log text is passed through JSON/MCP boundaries, actual newlines may arrive
+    as literal two-character '\\n' sequences. This normalizes them so line splitting works.
+    """
+    # Replace literal \n (two chars: backslash + n) with actual newline,
+    # but only when they appear between log lines (not inside JSON strings).
+    # Heuristic: literal \n followed by a timestamp pattern or log-level keyword.
+    import re
+    # Replace literal \n that precede a timestamp (YYYY-MM-DD) or log-level prefix
+    normalized = re.sub(
+        r'\\n(?=\d{4}-\d{2}-\d{2}|level=|"level"|time=|"ts"|msg=|http:)',
+        '\n',
+        log_text
+    )
+    # Also handle remaining literal \n as a fallback if no actual newlines are present
+    if '\n' not in normalized and '\\n' in normalized:
+        normalized = normalized.replace('\\n', '\n')
+    return normalized
+
+
 def extract_error_patterns(log_text: str) -> List[str]:
     """
     Extract common error patterns from log text including Kubernetes-specific errors.
@@ -868,6 +890,9 @@ def extract_error_patterns(log_text: str) -> List[str]:
     """
     if not log_text or log_text == "No pod logs available":
         return []
+
+    # Normalize escaped newlines from MCP/JSON transport
+    log_text = _normalize_log_newlines(log_text)
 
     # Common error patterns to look for (case-insensitive)
     patterns = [
@@ -960,6 +985,9 @@ def generate_log_summary(log_text: str, error_patterns: List[str], error_categor
     """
     if not log_text or log_text == "No pod logs available":
         return "No logs available to analyze."
+
+    # Normalize escaped newlines from MCP/JSON transport
+    log_text = _normalize_log_newlines(log_text)
 
     # Count total lines in log
     total_lines = len(log_text.split('\n'))
@@ -1477,7 +1505,7 @@ def get_resource_api_info(resource_type: str) -> Optional[Dict[str, Any]]:
     return resource_map.get(resource_type.lower(), None)
 
 
-def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_status: bool) -> Dict[str, Any]:
+def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_status: bool, resource_type_hint: str = "") -> Dict[str, Any]:
     """
     Extract relevant information from a Kubernetes resource.
 
@@ -1485,23 +1513,40 @@ def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_
         resource: Raw Kubernetes resource dictionary
         include_spec: Whether to include the spec field
         include_status: Whether to include the status field
+        resource_type_hint: Optional resource type (e.g. 'pods') used as fallback for kind
 
     Returns:
         Processed resource dictionary with standardized structure
     """
-    metadata = resource.get("metadata", {})
+    metadata = resource.get("metadata") or {}
+
+    # Handle both camelCase (raw API) and snake_case (Python client to_dict()) keys.
+    # Use `or` to handle None values from to_dict() where the key exists but is None.
+    # Kubernetes list API omits kind/apiVersion from individual items; use hint as fallback.
+    _type_to_kind = {
+        "pods": "Pod", "services": "Service", "deployments": "Deployment",
+        "replicasets": "ReplicaSet", "daemonsets": "DaemonSet", "statefulsets": "StatefulSet",
+        "jobs": "Job", "cronjobs": "CronJob", "configmaps": "ConfigMap",
+        "secrets": "Secret", "ingresses": "Ingress", "pvc": "PersistentVolumeClaim",
+        "serviceaccounts": "ServiceAccount", "nodes": "Node", "namespaces": "Namespace",
+        "pipelineruns": "PipelineRun", "taskruns": "TaskRun",
+    }
+    kind = resource.get("kind") or resource.get("Kind") or _type_to_kind.get(resource_type_hint, "") or "Unknown"
+    api_version = resource.get("apiVersion") or resource.get("api_version") or "Unknown"
+    creation_ts = metadata.get("creationTimestamp") or metadata.get("creation_timestamp") or ""
+    resource_version = metadata.get("resourceVersion") or metadata.get("resource_version") or ""
 
     resource_info = {
-        "kind": resource.get("kind", "Unknown"),
-        "api_version": resource.get("apiVersion", "Unknown"),
+        "kind": kind,
+        "api_version": api_version,
         "metadata": {
-            "name": metadata.get("name", ""),
-            "namespace": metadata.get("namespace", ""),
-            "labels": metadata.get("labels", {}),
-            "annotations": metadata.get("annotations", {}),
-            "creation_timestamp": metadata.get("creationTimestamp", ""),
-            "resource_version": metadata.get("resourceVersion", ""),
-            "uid": metadata.get("uid", "")
+            "name": metadata.get("name") or "",
+            "namespace": metadata.get("namespace") or "",
+            "labels": metadata.get("labels") or {},
+            "annotations": metadata.get("annotations") or {},
+            "creation_timestamp": creation_ts,
+            "resource_version": resource_version,
+            "uid": metadata.get("uid") or ""
         }
     }
 
@@ -1521,8 +1566,8 @@ def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_
         # Remove None values
         resource_info["status"] = {k: v for k, v in processed_status.items() if v is not None}
 
-    # Add owner references
-    owner_refs = metadata.get("ownerReferences", [])
+    # Add owner references (handle both camelCase and snake_case)
+    owner_refs = metadata.get("ownerReferences") or metadata.get("owner_references") or []
     resource_info["owner_references"] = [
         {
             "kind": ref.get("kind", ""),
@@ -2009,6 +2054,36 @@ def calibrate_simulation_models(
         return behavior_models  # Return original models if calibration fails
 
 
+def _parse_k8s_quantity(value: str) -> float:
+    """Parse a Kubernetes resource quantity string to a numeric value.
+
+    Handles suffixes: m (milli), Ki, Mi, Gi, Ti, K, M, G, T.
+    Examples: '500m' -> 0.5, '1Gi' -> 1073741824, '2' -> 2.0
+    """
+    value = value.strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    suffixes = {
+        "m": 0.001,
+        "Ki": 1024,
+        "Mi": 1024 ** 2,
+        "Gi": 1024 ** 3,
+        "Ti": 1024 ** 4,
+        "K": 1000,
+        "M": 1000 ** 2,
+        "G": 1000 ** 3,
+        "T": 1000 ** 4,
+    }
+    # Try longest suffixes first to match 'Gi' before 'G'
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if value.endswith(suffix):
+            numeric_part = value[:-len(suffix)]
+            return float(numeric_part) * suffixes[suffix]
+    raise ValueError(f"Cannot parse Kubernetes quantity: {value}")
+
+
 async def run_monte_carlo_simulation(
     models: Dict[str, Any],
     changes: Dict[str, Any],
@@ -2041,8 +2116,8 @@ async def run_monte_carlo_simulation(
         for key, val in changes.items():
             if isinstance(val, dict) and "before" in val and "after" in val:
                 try:
-                    before = float(val["before"])
-                    after = float(val["after"])
+                    before = _parse_k8s_quantity(str(val["before"]))
+                    after = _parse_k8s_quantity(str(val["after"]))
                     if before > 0:
                         ratio = abs(after - before) / before
                         change_magnitude = max(change_magnitude, ratio)
@@ -2058,9 +2133,13 @@ async def run_monte_carlo_simulation(
         }
         base = scenario_impacts.get(scenario_type, {"perf": 0.1, "reliability": 0.05, "cost": 0.2})
 
+        # Determine uncertainty factor once (outside the loop for consistency)
+        raw_uncertainty = models.get("resource_consumption", {}).get("uncertainty_factor", 0.1)
+        # Ensure minimum uncertainty so Monte Carlo produces meaningful variance
+        uncertainty_factor = max(raw_uncertainty, 0.05)
+
         for run in range(simulation_runs):
             # Add randomness to each simulation run
-            uncertainty_factor = models.get("resource_consumption", {}).get("uncertainty_factor", 0.1)
             random_factor = random.gauss(1.0, uncertainty_factor)
 
             performance_impact = random_factor * base["perf"] * change_magnitude

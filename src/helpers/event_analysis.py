@@ -656,13 +656,47 @@ def extract_event_content_for_classification(event_str: str) -> str:
 
 
 def classify_event_severity_from_string(event_str: str) -> str:
-    """Classify event severity from string representation."""
+    """Classify event severity from string representation.
+
+    Uses the Kubernetes event type (Normal/Warning) as a primary signal
+    before falling back to keyword matching, to avoid misclassifying
+    Normal progress events (e.g. 'Tasks Completed: 0 (Failed: 0, ...)')
+    as HIGH severity just because they contain the word 'Failed'.
+    """
 
     # Extract just the event content, excluding object names
     event_content = extract_event_content_for_classification(event_str)
     event_lower = event_content.lower()
 
-    # Check severity keywords from config
+    # Detect Kubernetes event type from the formatted string
+    # Format: [{timestamp}] Normal: reason - message  OR  [{timestamp}] Warning: reason - message
+    is_normal_event = False
+    is_warning_event = False
+    # Look for the type after the timestamp bracket
+    bracket_end = event_content.find("] ")
+    if bracket_end >= 0:
+        after_bracket = event_content[bracket_end + 2:].strip()
+        if after_bracket.startswith("Normal:") or after_bracket.startswith("normal:"):
+            is_normal_event = True
+        elif after_bracket.startswith("Warning:") or after_bracket.startswith("warning:"):
+            is_warning_event = True
+
+    # For Normal events, only escalate if content has CRITICAL keywords
+    if is_normal_event:
+        critical_keywords = SMART_EVENTS_CONFIG["severity_keywords"].get("CRITICAL", [])
+        if any(keyword in event_lower for keyword in critical_keywords):
+            return EventSeverity.CRITICAL.value
+        return EventSeverity.LOW.value
+
+    # For Warning events, check HIGH and CRITICAL keywords
+    if is_warning_event:
+        for severity in ["CRITICAL", "HIGH"]:
+            keywords = SMART_EVENTS_CONFIG["severity_keywords"].get(severity, [])
+            if any(keyword in event_lower for keyword in keywords):
+                return severity
+        return EventSeverity.MEDIUM.value
+
+    # Fallback: check severity keywords from config for unrecognized formats
     for severity, keywords in SMART_EVENTS_CONFIG["severity_keywords"].items():
         if any(keyword in event_lower for keyword in keywords):
             return severity
@@ -672,11 +706,34 @@ def classify_event_severity_from_string(event_str: str) -> str:
 
 
 def classify_event_category_from_string(event_str: str) -> str:
-    """Classify event category from string representation."""
+    """Classify event category from string representation.
+
+    For Normal Kubernetes events, defaults to LIFECYCLE unless content
+    clearly indicates a different category (e.g. storage, networking).
+    """
 
     # Extract just the event content, excluding object names
     event_content = extract_event_content_for_classification(event_str)
     event_lower = event_content.lower()
+
+    # Detect Normal event type to avoid categorizing progress events as FAILURE
+    bracket_end = event_content.find("] ")
+    is_normal_event = False
+    if bracket_end >= 0:
+        after_bracket = event_content[bracket_end + 2:].strip().lower()
+        if after_bracket.startswith("normal:"):
+            is_normal_event = True
+
+    if is_normal_event:
+        # For Normal events, check non-failure categories only
+        non_failure_categories = {
+            k: v for k, v in SMART_EVENTS_CONFIG["category_keywords"].items()
+            if k != "FAILURE"
+        }
+        for category, keywords in non_failure_categories.items():
+            if any(keyword in event_lower for keyword in keywords):
+                return category
+        return EventCategory.LIFECYCLE.value
 
     # Check category keywords from config
     for category, keywords in SMART_EVENTS_CONFIG["category_keywords"].items():

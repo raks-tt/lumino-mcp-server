@@ -315,6 +315,31 @@ async def perform_advanced_rca(
             if "log_analysis" in log_data:
                 all_errors.extend(log_data["log_analysis"].get("error_patterns", []))
 
+        # Fallback: extract error info from basic_analysis when logs are unavailable (e.g. GC'd pods)
+        if not all_errors:
+            basic = primary_analysis.get("basic_analysis", {})
+            if basic.get("overall_message"):
+                all_errors.append(basic["overall_message"])
+            for task in basic.get("failed_tasks", []):
+                if task.get("message"):
+                    all_errors.append(task["message"])
+                for pattern in task.get("error_patterns", []):
+                    all_errors.append(pattern)
+            if basic.get("probable_root_cause"):
+                all_errors.append(basic["probable_root_cause"])
+
+        # Fallback: extract error info from timeline events
+        if not all_errors and timeline:
+            for event in timeline:
+                desc = event.get("description", "")
+                if isinstance(desc, dict):
+                    desc = desc.get("event_string", str(desc))
+                desc_str = str(desc)
+                if any(kw in desc_str.lower() for kw in ["error", "failed", "failure", "warning"]):
+                    all_errors.append(desc_str[:200])
+                if len(all_errors) >= 10:
+                    break
+
         # Categorize errors
         error_text = " ".join(all_errors)
         categories = categorize_errors_func(error_text, all_errors)
@@ -322,11 +347,22 @@ async def perform_advanced_rca(
         # Determine primary cause
         primary_cause = {}
         if categories:
-            top_category = max(categories.items(), key=lambda x: x[1])
+            non_zero = {k: v for k, v in categories.items() if v > 0}
+            if non_zero:
+                top_category = max(non_zero.items(), key=lambda x: x[1])
+                primary_cause = {
+                    "category": top_category[0],
+                    "confidence": min(0.9, top_category[1] / 10.0),
+                    "description": get_category_description(top_category[0]),
+                    "evidence": all_errors[:3]
+                }
+
+        # Final fallback: if still empty, derive cause from available context
+        if not primary_cause and all_errors:
             primary_cause = {
-                "category": top_category[0],
-                "confidence": min(0.9, top_category[1] / 10.0),
-                "description": get_category_description(top_category[0]),
+                "category": "unknown",
+                "confidence": 0.3,
+                "description": "Root cause could not be precisely categorized from available evidence",
                 "evidence": all_errors[:3]
             }
 
