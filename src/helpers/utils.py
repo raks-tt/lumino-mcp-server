@@ -1547,6 +1547,11 @@ def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_
     creation_ts = metadata.get("creationTimestamp") or metadata.get("creation_timestamp") or ""
     resource_version = metadata.get("resourceVersion") or metadata.get("resource_version") or ""
 
+    kind = resource.get("kind") or _type_to_kind.get(resource_type_hint, "") or "Unknown"
+    api_version = resource.get("apiVersion") or resource.get("api_version") or _type_to_api_version.get(resource_type_hint, "Unknown")
+    creation_ts = metadata.get("creationTimestamp") or metadata.get("creation_timestamp") or ""
+    resource_version = metadata.get("resourceVersion") or metadata.get("resource_version") or ""
+
     resource_info = {
         "kind": kind,
         "api_version": api_version,
