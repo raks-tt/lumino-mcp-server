@@ -78,7 +78,46 @@ async def identify_failure_context(
             except ApiException:
                 continue
 
-        return {"found": False, "type": "unknown", "namespace": None, "object": None}
+        # Fallback: search events that reference the identifier (resource may have been GC'd)
+        for ns in all_namespaces:
+            try:
+                events = k8s_core_api.list_namespaced_event(
+                    namespace=ns,
+                    field_selector=f"involvedObject.name={failure_identifier}",
+                    limit=5
+                )
+                if events.items:
+                    involved_kind = events.items[0].involved_object.kind or "unknown"
+                    logger.info(f"Resource '{failure_identifier}' not found directly but has {len(events.items)} events in {ns} (kind: {involved_kind})")
+                    return {
+                        "found": True,
+                        "type": involved_kind.lower(),
+                        "namespace": ns,
+                        "object": None,
+                        "gc_detected": True,
+                        "event_count": len(events.items),
+                        "events": [
+                            {
+                                "reason": e.reason,
+                                "message": (e.message or "")[:200],
+                                "type": e.type,
+                                "last_timestamp": e.last_timestamp.isoformat() if e.last_timestamp else None,
+                            }
+                            for e in events.items
+                        ]
+                    }
+            except ApiException:
+                continue
+
+        namespaces_searched = all_namespaces[:10]  # Limit for readability
+        return {
+            "found": False,
+            "type": "unknown",
+            "namespace": namespace,
+            "object": None,
+            "namespaces_searched": namespaces_searched,
+            "search_note": f"Resource '{failure_identifier}' not found as PipelineRun, Pod, or TaskRun in {len(all_namespaces)} namespace(s). It may have been garbage collected and events expired."
+        }
 
     except Exception as e:
         logger.error(f"Error identifying failure context: {str(e)}")
