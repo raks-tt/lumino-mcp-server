@@ -441,6 +441,19 @@ def _count_related_entries(lines: List[str], current_index: int, semantic_keywor
 # RESULT RANKING AND PROCESSING
 # ============================================================================
 
+def _truncate_result_content(result: Dict[str, Any], max_message_len: int = 300) -> Dict[str, Any]:
+    """Truncate log message content in a search result to limit output size."""
+    result = result.copy()
+    log_entry = result.get("log_entry", {})
+    if isinstance(log_entry, dict):
+        msg = log_entry.get("message", "")
+        if isinstance(msg, str) and len(msg) > max_message_len:
+            log_entry = log_entry.copy()
+            log_entry["message"] = msg[:max_message_len] + "..."
+            result["log_entry"] = log_entry
+    return result
+
+
 def rank_results_by_semantic_relevance(
     all_results: List[Dict[str, Any]],
     query_interpretation: Dict[str, Any],
@@ -461,18 +474,20 @@ def rank_results_by_semantic_relevance(
             reverse=True
         )
 
-        # Flatten and limit results
+        # Deduplicate: keep only the best representative from each group
         ranked_results = []
         for group in ranked_groups:
-            # Add best items from each group
-            group_sorted = sorted(group, key=lambda x: x.get('relevance_score', 0), reverse=True)
-            for item in group_sorted:
-                ranked_results.append(item)
+            best = max(group, key=lambda x: x.get('relevance_score', 0))
+            best = _truncate_result_content(best)
+            if len(group) > 1:
+                best["similar_count"] = len(group) - 1
+            ranked_results.append(best)
 
         return ranked_results
     else:
-        # Simple sort by relevance
-        return sorted(all_results, key=lambda x: x.get('relevance_score', 0), reverse=True)
+        # Simple sort by relevance, with truncation
+        sorted_results = sorted(all_results, key=lambda x: x.get('relevance_score', 0), reverse=True)
+        return [_truncate_result_content(r) for r in sorted_results]
 
 
 def _group_similar_results(results: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:

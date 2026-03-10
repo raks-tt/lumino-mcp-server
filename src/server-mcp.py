@@ -11463,7 +11463,26 @@ async def resource_bottleneck_forecaster(
         forecasts = []
         if "cpu" in resource_types or "memory" in resource_types or "disk" in resource_types:
             node_forecasts = await _analyze_node_resources_new(trend_analysis_period, forecast_horizon, logger)
-            forecasts.extend(node_forecasts)
+
+            if namespaces:
+                # When specific namespaces are requested, limit node output to prevent
+                # bloated responses (56+ nodes * 3 resource types = 168+ entries).
+                # Keep: nodes approaching exhaustion + top-N most utilized nodes.
+                MAX_NODE_FORECASTS = 20
+
+                critical = [f for f in node_forecasts if f.get('predicted_exhaustion')]
+                normal = [f for f in node_forecasts if not f.get('predicted_exhaustion')]
+                normal.sort(key=lambda f: f.get('current_usage', {}).get('value', 0), reverse=True)
+
+                remaining_slots = max(0, MAX_NODE_FORECASTS - len(critical))
+                forecasts.extend(critical)
+                forecasts.extend(normal[:remaining_slots])
+
+                if len(node_forecasts) > MAX_NODE_FORECASTS:
+                    logger.info(f"Trimmed node forecasts from {len(node_forecasts)} to {len(forecasts)} "
+                                f"({len(critical)} critical + {remaining_slots} top utilized)")
+            else:
+                forecasts.extend(node_forecasts)
 
         # Analyze namespace-specific resources if specified
         if namespaces:
