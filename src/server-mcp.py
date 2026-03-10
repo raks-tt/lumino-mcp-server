@@ -1824,7 +1824,7 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
                     "reason": f"Unusually long duration (z-score: {anomaly.get('z_score', 0):.2f})",
                     "actual_value": anomaly.get("value"),
                     "expected_range": (
-                        stats["mean"] - 2 * stats["std_dev"],
+                        max(0, stats["mean"] - 2 * stats["std_dev"]),
                         stats["mean"] + 2 * stats["std_dev"]
                     )
                 })
@@ -1840,7 +1840,7 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
                     "reason": f"Unusually long duration (z-score: {anomaly.get('z_score', 0):.2f})",
                     "actual_value": anomaly.get("value"),
                     "expected_range": (
-                        stats["mean"] - 2 * stats["std_dev"],
+                        max(0, stats["mean"] - 2 * stats["std_dev"]),
                         stats["mean"] + 2 * stats["std_dev"]
                     )
                 })
