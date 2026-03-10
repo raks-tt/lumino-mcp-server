@@ -3532,8 +3532,17 @@ async def detect_log_anomalies(
         }
 
     try:
+        # Normalize escaped newlines from MCP/JSON transport (literal \n -> actual newline)
+        import re as _re
+        normalized_logs = _re.sub(
+            r'\\n(?=\d{4}-\d{2}-\d{2}|level=|"level"|time=|"ts"|msg=|http:)',
+            '\n', logs
+        )
+        if '\n' not in normalized_logs and '\\n' in normalized_logs:
+            normalized_logs = normalized_logs.replace('\\n', '\n')
+
         # Parse logs into lines
-        log_lines = [line.strip() for line in logs.split('\n') if line.strip()]
+        log_lines = [line.strip() for line in normalized_logs.split('\n') if line.strip()]
         total_lines = len(log_lines)
 
         if total_lines == 0:
@@ -3901,7 +3910,8 @@ async def search_resources_by_labels(
                                 processed_resource = extract_resource_info(
                                     resource_dict,
                                     not include_metadata_only,
-                                    include_status
+                                    include_status,
+                                    resource_type_hint=resource_type
                                 )
                                 resources_found.append(processed_resource)
                                 type_count += 1
@@ -3949,7 +3959,8 @@ async def search_resources_by_labels(
                             processed_resource = extract_resource_info(
                                 resource_dict,
                                 not include_metadata_only,
-                                include_status
+                                include_status,
+                                resource_type_hint=resource_type
                             )
                             resources_found.append(processed_resource)
                             type_count += 1
