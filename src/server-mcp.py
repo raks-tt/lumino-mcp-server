@@ -10719,20 +10719,11 @@ async def predictive_log_analyzer(
                     end_time=datetime.now()
                 )
 
-                # Correlate logs with failures if we have both
-                if historical_failures and len(log_df) > 0:
-                    log_samples = log_df.to_dict('records')
-                    correlations = failure_collector.correlate_logs_with_failures(
-                        log_samples, historical_failures, time_window_minutes=30
-                    )
-                    if correlations:
-                        labels = build_labels_from_correlations(correlations, len(log_df))
-                        logger.info(f"Created {len(correlations)} log-failure correlations")
-
-                # Store log samples for future training
+                # Store log samples first so they get database IDs for correlation
+                stored_samples = []
                 for idx, row in log_df.iterrows():
                     if idx < 500:  # Limit to avoid excessive storage
-                        training_store.store_log_sample({
+                        sample_data = {
                             "timestamp": row.get("timestamp"),
                             "namespace": target_namespaces[0] if target_namespaces else "unknown",
                             "features": features[idx].tolist() if idx < len(features) else [],
@@ -10740,7 +10731,24 @@ async def predictive_log_analyzer(
                             "log_level": row.get("log_level"),
                             "error_indicators": int(row.get("error_indicators", 0)),
                             "message_entropy": float(row.get("message_entropy", 0.0))
-                        })
+                        }
+                        sample_id = training_store.store_log_sample(sample_data)
+                        if sample_id:
+                            stored_samples.append({
+                                "id": sample_id,
+                                "timestamp": sample_data["timestamp"],
+                                "namespace": sample_data["namespace"]
+                            })
+
+                # Correlate stored log samples with failures using database IDs
+                if historical_failures and stored_samples:
+                    correlations = failure_collector.correlate_logs_with_failures(
+                        stored_samples, historical_failures, time_window_minutes=30
+                    )
+                    if correlations:
+                        labels = build_labels_from_correlations(correlations, len(log_df))
+                        logger.info(f"Created {len(correlations)} log-failure correlations")
+
             except Exception as e:
                 logger.warning(f"Failed to collect/correlate failure events: {e}")
 

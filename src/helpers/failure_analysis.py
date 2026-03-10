@@ -984,23 +984,25 @@ def perform_risk_assessment(
         risk_factors = []
         risk_scores = []
 
-        # Assess performance risk
+        # Assess performance risk — always contribute a proportional score
         perf_impact = impact_analysis.get("performance_impact", {})
         perf_mean = 0
         if perf_impact:
             perf_mean = simulation_results.get("performance_impact", {}).get("mean", 0)
-            if abs(perf_mean) > 0.2:
+            perf_score = min(100, abs(perf_mean) * 100)
+            risk_scores.append(perf_score)
+            if abs(perf_mean) > 0.15:
                 risk_factors.append(f"Significant performance impact: {perf_impact.get('expected_change', 'unknown')}")
-                risk_scores.append(min(100, abs(perf_mean) * 100))
 
-        # Assess reliability risk
+        # Assess reliability risk — always contribute a proportional score
         rel_impact = impact_analysis.get("reliability_impact", {})
         rel_mean = 0
         if rel_impact:
             rel_mean = simulation_results.get("reliability_impact", {}).get("mean", 0)
-            if abs(rel_mean) > 0.1:
+            rel_score = min(100, abs(rel_mean) * 150)
+            risk_scores.append(rel_score)
+            if abs(rel_mean) >= 0.1:
                 risk_factors.append(f"Reliability impact: {rel_impact.get('expected_change', 'unknown')}")
-                risk_scores.append(min(100, abs(rel_mean) * 150))
 
         # Assess component risk
         critical_components = 0

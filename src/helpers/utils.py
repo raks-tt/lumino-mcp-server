@@ -1531,8 +1531,24 @@ def extract_resource_info(resource: Dict[str, Any], include_spec: bool, include_
         "serviceaccounts": "ServiceAccount", "nodes": "Node", "namespaces": "Namespace",
         "pipelineruns": "PipelineRun", "taskruns": "TaskRun",
     }
+    _type_to_api_version = {
+        "pods": "v1", "services": "v1", "configmaps": "v1", "secrets": "v1",
+        "serviceaccounts": "v1", "namespaces": "v1", "nodes": "v1",
+        "pvc": "v1", "persistentvolumes": "v1", "endpoints": "v1", "events": "v1",
+        "deployments": "apps/v1", "replicasets": "apps/v1",
+        "daemonsets": "apps/v1", "statefulsets": "apps/v1",
+        "jobs": "batch/v1", "cronjobs": "batch/v1",
+        "ingresses": "networking.k8s.io/v1",
+        "pipelineruns": "tekton.dev/v1", "taskruns": "tekton.dev/v1",
+        "pipelines": "tekton.dev/v1", "tasks": "tekton.dev/v1",
+    }
     kind = resource.get("kind") or resource.get("Kind") or _type_to_kind.get(resource_type_hint, "") or "Unknown"
-    api_version = resource.get("apiVersion") or resource.get("api_version") or "Unknown"
+    api_version = resource.get("apiVersion") or resource.get("api_version") or _type_to_api_version.get(resource_type_hint, "Unknown")
+    creation_ts = metadata.get("creationTimestamp") or metadata.get("creation_timestamp") or ""
+    resource_version = metadata.get("resourceVersion") or metadata.get("resource_version") or ""
+
+    kind = resource.get("kind") or _type_to_kind.get(resource_type_hint, "") or "Unknown"
+    api_version = resource.get("apiVersion") or resource.get("api_version") or _type_to_api_version.get(resource_type_hint, "Unknown")
     creation_ts = metadata.get("creationTimestamp") or metadata.get("creation_timestamp") or ""
     resource_version = metadata.get("resourceVersion") or metadata.get("resource_version") or ""
 
