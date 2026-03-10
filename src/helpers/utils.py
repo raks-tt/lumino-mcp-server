@@ -1791,6 +1791,23 @@ def parse_certificate(cert_data: str) -> Optional[Dict[str, Any]]:
         expiry_date = cert.not_valid_after
         days_remaining = (expiry_date - now).days
 
+        # Extract key size from public key
+        key_size = None
+        try:
+            public_key = cert.public_key()
+            if hasattr(public_key, 'key_size'):
+                key_size = public_key.key_size
+        except Exception:
+            pass
+
+        # Extract is_ca from BasicConstraints extension
+        is_ca = False
+        try:
+            bc_ext = cert.extensions.get_extension_for_oid(ExtensionOID.BASIC_CONSTRAINTS)
+            is_ca = bc_ext.value.ca
+        except (x509.ExtensionNotFound, AttributeError):
+            pass
+
         return {
             'subject_cn': subject_cn,
             'issuer_cn': issuer_cn,
@@ -1802,8 +1819,8 @@ def parse_certificate(cert_data: str) -> Optional[Dict[str, Any]]:
             'serial_number': str(cert.serial_number),
             'signature_algorithm': cert.signature_algorithm_oid._name,
             'san': san_list,
-            'is_ca': False,  # Will be determined by usage analysis
-            'key_size': None  # Will be extracted if possible
+            'is_ca': is_ca,
+            'key_size': key_size
         }
     except Exception as e:
         logger.debug(f"Failed to parse certificate: {e}")
