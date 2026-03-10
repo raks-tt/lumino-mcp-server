@@ -6417,6 +6417,33 @@ async def conservative_namespace_overview(
         total_pods = len(pods_info) if isinstance(pods_info, list) else 0
         logger.info(f"[{tool_name}] Found {total_pods} pods, will analyze top {min(max_pods, total_pods)}")
 
+        # Report when no pods are found — may indicate RBAC restrictions
+        if total_pods == 0:
+            return {
+                "overview": {
+                    "namespace": namespace,
+                    "total_pods": 0,
+                    "pods_analyzed": 0,
+                    "pods_with_issues": 0,
+                    "critical_issues_found": 0,
+                    "analysis_strategy": f"conservative sampling of 0/0 pods"
+                },
+                "pod_findings": {},
+                "critical_issues": [],
+                "recommendations": [
+                    f"No pods found in namespace '{namespace}'",
+                    "This may indicate RBAC restrictions preventing pod listing, or the namespace has no running workloads",
+                    "Verify access with: kubectl auth can-i list pods -n " + namespace
+                ],
+                "conservative_metadata": {
+                    "token_budget": f"<{max_total_tokens:,} tokens (conservative)",
+                    "sampling_strategy": sample_strategy,
+                    "coverage_ratio": "0/0",
+                    "optimized_for": "large_namespaces",
+                    "note": "zero_pods_detected"
+                }
+            }
+
         # Smart pod selection based on strategy
         if sample_strategy == "smart" and isinstance(pods_info, list):
             # Prioritize pods likely to have issues
@@ -6610,7 +6637,9 @@ async def adaptive_namespace_investigation(
             events_result = {"error": "Invalid events result type"}
         compressed_events = _compress_events_for_synthesis(events_result)
 
-        processor.record_usage(discovery_budget // 2)  # Estimate discovery token usage
+        # Track actual token usage from events result instead of full budget allocation
+        actual_event_tokens = events_result.get("token_usage", {}).get("total_estimated", discovery_budget // 4)
+        processor.record_usage(actual_event_tokens)
 
         # Phase 2: Intelligent Analysis (80% of budget)
         analysis_budget = int(token_budget * 0.8)
@@ -6701,7 +6730,13 @@ async def adaptive_namespace_investigation(
                                 for error in result["analysis"]["patterns"]["errors"][:2]
                             ])
 
-                    processor.record_usage(per_pod_budget)  # Estimate usage
+                    # Track actual tokens used from analysis metadata, not the full budget allocation
+                    actual_pod_tokens = 0
+                    if result["analysis"]:
+                        actual_pod_tokens = result["analysis"].get("metadata", {}).get(
+                            "processing_metrics", {}
+                        ).get("estimated_tokens_used", per_pod_budget // 4)
+                    processor.record_usage(max(actual_pod_tokens, 100))  # At least 100 tokens per pod
                     pods_analyzed += 1
 
                 logger.info(f"[{tool_name}] Analyzed {pods_analyzed}/{pods_to_analyze} pods so far")
@@ -7532,12 +7567,42 @@ async def progressive_event_analysis(
             })
 
         if not classified_events:
-            return {
-                "namespace": namespace,
-                "analysis_level": analysis_level,
-                "message": "No events found for analysis",
-                "suggestion": "Try a longer time period or different namespace"
-            }
+            # Progressive fallback: try wider time windows before giving up
+            fallback_periods = ["12h", "24h", "7d"]
+            original_period = time_period or "default"
+            for fallback_period in fallback_periods:
+                if fallback_period == time_period:
+                    continue
+                logger.info(f"[{tool_name}] No events with {original_period}, trying {fallback_period}")
+                fallback_result = await smart_get_namespace_events(
+                    namespace=namespace,
+                    time_period=fallback_period,
+                    strategy="smart_summary",
+                    focus_areas=focus_areas,
+                    include_summary=False
+                )
+                for event in fallback_result.get("events", []):
+                    classified_events.append({
+                        "event_string": event.get("event_string", ""),
+                        "severity": event.get("severity"),
+                        "category": event.get("category"),
+                        "relevance_score": event.get("relevance_score", 0),
+                        "timestamp": datetime.fromisoformat(event.get("timestamp", datetime.now().isoformat())),
+                        "token_estimate": event.get("token_estimate", 0)
+                    })
+                if classified_events:
+                    time_period = fallback_period
+                    logger.info(f"[{tool_name}] Found {len(classified_events)} events with {fallback_period} fallback")
+                    break
+
+            if not classified_events:
+                return {
+                    "namespace": namespace,
+                    "analysis_level": analysis_level,
+                    "message": "No events found for analysis",
+                    "time_periods_tried": [original_period] + fallback_periods,
+                    "suggestion": "No events in this namespace within the last 7 days. The namespace may not generate Kubernetes events, or events have been garbage collected."
+                }
 
         # Initialize progressive analyzer
         analyzer = ProgressiveEventAnalyzer(classified_events)
@@ -7646,12 +7711,50 @@ async def advanced_event_analytics(
                     })
 
         if not events_data:
-            return {
+            # Fallback: even without events, try log and metrics correlation if enabled
+            fallback_result = {
                 "namespace": namespace,
                 "analysis_type": "advanced_analytics",
-                "message": "No events available for advanced analysis",
-                "suggestion": "Try a longer time period or different namespace"
+                "analysis_depth": analysis_depth,
+                "total_events_analyzed": 0,
+                "time_period": time_period,
+                "generated_at": datetime.now().isoformat(),
+                "note": "No Kubernetes events found; performing log/metrics-only analysis"
             }
+            has_fallback_data = False
+
+            if include_log_correlation:
+                try:
+                    log_integrator = LogMetricsIntegrator([])
+                    log_correlation = await log_integrator.correlate_with_logs(namespace, time_period or "2h")
+                    fallback_result["log_correlation"] = log_correlation
+                    has_fallback_data = True
+                except Exception as e:
+                    logger.warning(f"[{tool_name}] Log correlation fallback failed: {e}")
+
+            if include_metrics_correlation:
+                try:
+                    if not include_log_correlation:
+                        log_integrator = LogMetricsIntegrator([])
+                    metrics_correlation = await log_integrator.correlate_with_metrics(namespace)
+                    fallback_result["metrics_correlation"] = metrics_correlation
+                    has_fallback_data = True
+                except Exception as e:
+                    logger.warning(f"[{tool_name}] Metrics correlation fallback failed: {e}")
+
+            if include_runbook_suggestions:
+                fallback_result["runbook_suggestions"] = [
+                    "No events detected — check if event generation is working in this namespace",
+                    "Verify namespace has active workloads: kubectl get pods -n " + namespace,
+                    "Check if events are being garbage collected prematurely"
+                ]
+                has_fallback_data = True
+
+            if not has_fallback_data:
+                fallback_result["message"] = "No events available and fallback analysis produced no data"
+                fallback_result["suggestion"] = "Try a longer time period or different namespace"
+
+            return fallback_result
 
         # Initialize analysis result
         analytics_result = {
@@ -8039,8 +8142,9 @@ async def check_cluster_certificate_health(
                 continue
 
         # Process OpenShift system certificates if requested
-        # Only scan additional system namespaces if user didn't specify specific namespaces
-        if include_system_certs and namespaces is None:
+        # Always scan system cert namespaces when include_system_certs=True,
+        # even when specific namespaces were provided (they may have been RBAC-blocked)
+        if include_system_certs:
             try:
                 # Try to get OpenShift cluster certificates
                 system_cert_namespaces = [

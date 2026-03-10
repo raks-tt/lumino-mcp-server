@@ -347,8 +347,10 @@ def extract_log_patterns(log_lines: List[str], focus_areas: List[str], max_patte
         ]
     }
 
-    # Areas where structured JSON log level should gate pattern matching
-    _error_sensitive_areas = {"errors", "warnings", "exceptions"}
+    # Areas where structured JSON log level should gate pattern matching.
+    # Include "performance" to prevent false positives from timeout/latency
+    # values in pipeline parameters of info-level structured log lines.
+    _error_sensitive_areas = {"errors", "warnings", "exceptions", "performance"}
 
     for line_num, line in enumerate(log_lines, 1):
         timestamp = extract_timestamp(line)
