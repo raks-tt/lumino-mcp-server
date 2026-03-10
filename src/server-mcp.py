@@ -2719,6 +2719,18 @@ async def analyze_failed_pipeline(namespace: str, pipeline_run: str) -> Dict[str
                 log_analysis = await analyze_logs(log_content)
                 error_patterns = log_analysis.get("error_patterns", [])
                 error_categories = log_analysis.get("categorized_errors", {})
+
+                # If log analysis found nothing but steps failed, supplement with step info
+                if not error_patterns and failed_steps:
+                    task_message = task_details.get("message", "")
+                    for step in failed_steps:
+                        step_msg = f"Step '{step['step_name']}' failed with exit code {step['exit_code']}"
+                        if step.get("reason"):
+                            step_msg += f" (reason: {step['reason']})"
+                        error_patterns.append(step_msg)
+                    if task_message:
+                        error_patterns.append(f"Task message: {task_message}")
+                    error_categories["step_failures"] = len(failed_steps)
             else:
                 # Use step failure info when logs unavailable
                 error_patterns = []

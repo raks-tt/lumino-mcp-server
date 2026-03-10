@@ -1088,8 +1088,47 @@ def determine_root_cause(analysis_results: Dict[str, Any]) -> str:
             return "Configuration errors - check pipeline parameters and ConfigMaps"
         elif category == "dependency":
             return "Dependency issues - check for missing dependencies or version mismatches"
+        elif category == "step_failures":
+            # Build description from failed step details
+            failed_step_details = []
+            for task in analysis_results["failed_tasks"]:
+                for step in task.get("failed_steps", []):
+                    step_name = step.get("step_name", "unknown")
+                    exit_code = step.get("exit_code", "?")
+                    failed_step_details.append(f"'{step_name}' (exit code {exit_code})")
+            if failed_step_details:
+                steps_str = ", ".join(failed_step_details[:3])
+                return f"Task step failure - step {steps_str} exited with non-zero code"
+            return "Task step failure - one or more steps exited with non-zero code"
         elif category == "filesystem":
             return "Filesystem issues - check for missing files or storage problems"
+
+    # Fallback: check for failed_steps even without categorized errors
+    all_failed_steps = []
+    for task in analysis_results["failed_tasks"]:
+        for step in task.get("failed_steps", []):
+            all_failed_steps.append(step)
+    if all_failed_steps:
+        step_details = []
+        for step in all_failed_steps[:3]:
+            step_name = step.get("step_name", "unknown")
+            exit_code = step.get("exit_code", "?")
+            reason = step.get("reason", "")
+            detail = f"'{step_name}' (exit code {exit_code})"
+            if reason:
+                detail += f" [{reason}]"
+            step_details.append(detail)
+        steps_str = ", ".join(step_details)
+        return f"Task step failure - step {steps_str} exited with non-zero code"
+
+    # Check task messages for additional context
+    task_messages = []
+    for task in analysis_results["failed_tasks"]:
+        msg = task.get("message", "")
+        if msg:
+            task_messages.append(msg)
+    if task_messages:
+        return f"Pipeline task failure: {task_messages[0][:150]}"
 
     return "Indeterminate - multiple potential causes"
 
@@ -1204,6 +1243,19 @@ def recommend_actions(analysis_results: Dict[str, Any]) -> List[str]:
             "Check if required files exist in workspace volumes",
             "Review storage provisioner logs"
         ])
+    elif "step failure" in root_cause or "task step" in root_cause:
+        recommendations.extend([
+            "Check the failed step's output for specific error details",
+            "Review the task definition for the failing step",
+            "Verify input parameters and workspace contents are correct",
+            "Compare with previous successful runs of the same pipeline",
+        ])
+        # Add step-specific recommendations
+        for task in analysis_results.get("failed_tasks", []):
+            for step in task.get("failed_steps", []):
+                step_name = step.get("step_name", "")
+                if step_name:
+                    recommendations.append(f"Investigate step '{step_name}' - check its script/command logic")
     else:
         # Generic recommendations when root cause is unclear
         recommendations.extend([
