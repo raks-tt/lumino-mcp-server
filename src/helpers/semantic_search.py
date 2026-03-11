@@ -57,6 +57,7 @@ def interpret_semantic_query(query: str, time_range: str) -> Dict[str, Any]:
     interpreted_intent = _build_interpreted_intent(primary_intent, query_lower, temporal_context)
 
     return {
+        'original_query': query,
         'primary_intent': primary_intent,
         'interpreted_intent': interpreted_intent,
         'temporal_context': temporal_context,
@@ -221,13 +222,16 @@ def find_semantic_matches(
     lines: List[str],
     semantic_keywords: List[str],
     primary_intent: str,
-    max_results: int = 50
+    max_results: int = 50,
+    original_query_terms: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
     """Find semantically relevant matches in log lines."""
     matches = []
 
     for i, line in enumerate(lines):
-        relevance_score = calculate_semantic_relevance(line, semantic_keywords, primary_intent)
+        relevance_score = calculate_semantic_relevance(
+            line, semantic_keywords, primary_intent, original_query_terms
+        )
 
         if relevance_score > 0.3:  # Threshold for relevance
             timestamp, level = extract_log_metadata(line)
@@ -241,23 +245,37 @@ def find_semantic_matches(
                 'related_count': _count_related_entries(lines, i, semantic_keywords)
             })
 
+    # Sort by relevance score descending so best matches come first
+    matches.sort(key=lambda x: x['relevance_score'], reverse=True)
     return matches[:max_results]
 
 
 def calculate_semantic_relevance(
     line: str,
     semantic_keywords: List[str],
-    primary_intent: str
+    primary_intent: str,
+    original_query_terms: Optional[List[str]] = None
 ) -> float:
-    """Calculate semantic relevance score for a log line."""
+    """Calculate semantic relevance score for a log line.
+
+    Prioritizes matches on original query terms over expanded/generic keywords.
+    """
     line_lower = line.lower()
     score = 0.0
 
-    # Keyword matching (weighted)
-    keyword_matches = sum(1 for keyword in semantic_keywords if keyword in line_lower)
-    score += keyword_matches * 0.3
+    # Original query term matching (high weight - these are what the user actually asked for)
+    original_term_matched = False
+    if original_query_terms:
+        for term in original_query_terms:
+            if term.lower() in line_lower:
+                score += 0.5
+                original_term_matched = True
 
-    # Intent-specific patterns
+    # Expanded keyword matching (lower weight)
+    keyword_matches = sum(1 for keyword in semantic_keywords if keyword in line_lower)
+    score += keyword_matches * 0.15
+
+    # Intent-specific patterns (lower weight to avoid generic "error" dominating)
     intent_patterns = {
         'error_investigation': ['error', 'exception', 'fail', 'crash', 'panic', 'fatal'],
         'performance_analysis': ['slow', 'timeout', 'latency', 'cpu', 'memory', 'performance'],
@@ -270,26 +288,31 @@ def calculate_semantic_relevance(
 
     patterns = intent_patterns.get(primary_intent, [])
     pattern_matches = sum(1 for pattern in patterns if pattern in line_lower)
-    score += pattern_matches * 0.4
+    score += pattern_matches * 0.2
 
-    # Severity indicators
+    # Severity-based scoring: prefer error/warn over info for error-focused searches
     severity_indicators = {
         'error': 0.8, 'fatal': 0.9, 'panic': 0.9, 'exception': 0.7,
-        'warn': 0.6, 'warning': 0.6, 'info': 0.3, 'debug': 0.1
+        'warn': 0.6, 'warning': 0.6, 'info': 0.1, 'debug': 0.05
     }
 
     for indicator, weight in severity_indicators.items():
         if indicator in line_lower:
-            score += weight * 0.3
+            score += weight * 0.2
             break
 
-    # Timestamp recency (lines with timestamps are more valuable)
+    # Timestamp presence
     if re.search(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}', line):
-        score += 0.1
+        score += 0.05
 
     # Structured log indicators
     if any(char in line for char in ['{', '}', '=', ':']):
-        score += 0.1
+        score += 0.05
+
+    # Penalty: if user provided specific query terms but none matched,
+    # reduce score significantly to filter out generic noise
+    if original_query_terms and not original_term_matched:
+        score *= 0.4
 
     return min(score, 1.0)  # Cap at 1.0
 
@@ -823,11 +846,17 @@ async def _search_pod_logs_semantically(
         logs_lines = all_logs_lines
 
         # Perform semantic matching on logs
+        # Extract original query terms (words > 2 chars, excluding stop words)
+        original_query = query_interpretation.get('original_query', '')
+        stop_words = {'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'has', 'have', 'from', 'with', 'they', 'been', 'that', 'this', 'what', 'which', 'errors', 'logs', 'find', 'show', 'get', 'any', 'pods'}
+        original_terms = [w for w in original_query.lower().split() if len(w) > 2 and w not in stop_words]
+
         matches = find_semantic_matches_func(
             logs_lines,
             query_interpretation.get('semantic_keywords', []),
-            query_interpretation.get('interpreted_intent', 'general_search'),
-            search_params.get('max_results', 50)
+            query_interpretation.get('primary_intent', 'general_search'),
+            search_params.get('max_results', 50),
+            original_query_terms=original_terms
         )
 
         for match in matches:
