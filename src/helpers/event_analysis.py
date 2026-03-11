@@ -318,7 +318,7 @@ class ProgressiveEventAnalyzer:
             for event in self.classified_events:
                 event_content = event.get("event_string", "").lower()
 
-                if any(pattern in event_content for pattern in ["memory", "cpu", "disk", "resource", "quota"]):
+                if any(pattern in event_content for pattern in ["memory limit", "oom", "cpu limit", "disk full", "resource quota", "quota exceeded", "evicted"]):
                     root_causes["resource_exhaustion"].append(event)
                 elif any(pattern in event_content for pattern in ["network", "connection", "dns", "timeout"]):
                     root_causes["network_issues"].append(event)
@@ -1330,7 +1330,10 @@ class MLPatternDetector:
 
             if len(recent_events) > len(self.events) * 0.5:  # More than 50% of events in last hour
                 indicators["trending_issues"].append("High event frequency in recent period")
-                indicators["escalation_risk"] = "HIGH"
+                # Only escalate risk if recent events include HIGH/CRITICAL severity
+                recent_high = [e for e in recent_events if e.get("severity") in ("HIGH", "CRITICAL")]
+                if recent_high:
+                    indicators["escalation_risk"] = "HIGH"
 
             # Check for critical event trends
             critical_recent = [e for e in recent_events if e.get("severity") == "CRITICAL"]
@@ -1596,6 +1599,18 @@ def assess_overall_risk(analytics_result: Dict[str, Any]) -> Dict[str, Any]:
     if critical_runbooks:
         risk_factors.append(f"Critical runbooks required: {len(critical_runbooks)}")
         risk_score += 0.25
+
+    # Incorporate ML predictive indicators for consistency
+    if "predictive_indicators" in ml_patterns:
+        pred = ml_patterns["predictive_indicators"]
+        if isinstance(pred, dict):
+            escalation_risk = pred.get("escalation_risk", "LOW")
+            if escalation_risk == "CRITICAL":
+                risk_factors.append("ML prediction: critical escalation risk")
+                risk_score += 0.3
+            elif escalation_risk == "HIGH":
+                risk_factors.append("ML prediction: high escalation risk")
+                risk_score += 0.15
 
     # Determine overall risk level
     if risk_score >= 0.7:
