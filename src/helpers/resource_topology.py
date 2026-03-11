@@ -181,11 +181,18 @@ def matches_trace_identifier(pipeline_run: Dict[str, Any], trace_identifier: str
 
     if trace_type == "commit":
         # Look for commit SHA in labels and annotations
-        commit_keys = ["git.commit", "tekton.dev/git-commit", "pipelinesascode.tekton.dev/sha"]
+        # Support multiple PAC/Konflux label formats
+        commit_keys = [
+            "pipelinesascode.tekton.dev/sha",               # Standard PAC
+            "pac.test.appstudio.openshift.io/sha",           # Konflux/AppStudio PAC
+            "tekton.dev/git-commit",                          # Tekton standard
+            "git.commit",                                     # Generic
+            "build.appstudio.redhat.com/commit_sha",          # Red Hat AppStudio
+        ]
         for key in commit_keys:
             if labels.get(key, "").startswith(trace_identifier) or annotations.get(key, "").startswith(trace_identifier):
                 return True
-        # Also check in all values
+        # Also check in all values (catches non-standard label placements)
         return any(trace_identifier in str(v) for v in labels.values()) or \
                any(trace_identifier in str(v) for v in annotations.values())
 
