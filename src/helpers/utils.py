@@ -244,6 +244,15 @@ def parse_time_parameters(since_seconds: Optional[int] = None,
     }
 
 
+def _strip_none_values(obj):
+    """Recursively strip None values and empty dicts/lists from a nested dict for cleaner output."""
+    if isinstance(obj, dict):
+        return {k: _strip_none_values(v) for k, v in obj.items() if v is not None and _strip_none_values(v) not in (None, {}, [])}
+    elif isinstance(obj, list):
+        return [_strip_none_values(item) for item in obj if item is not None]
+    return obj
+
+
 def format_yaml_output(resource_obj: Any, resource_type: str, name: str, namespace: str) -> str:
     """Format resource as YAML output."""
     try:
@@ -303,13 +312,13 @@ def format_detailed_output(resource_obj: Any, resource_type: str, name: str, nam
         spec = resource_dict.get('spec', {})
         if spec:
             output.append("\n--- SPECIFICATION ---")
-            output.append(json.dumps(spec, indent=2, default=str))
+            output.append(json.dumps(_strip_none_values(spec), indent=2, default=str))
 
         # Status
         status = resource_dict.get('status', {})
         if status:
             output.append("\n--- STATUS ---")
-            output.append(json.dumps(status, indent=2, default=str))
+            output.append(json.dumps(_strip_none_values(status), indent=2, default=str))
 
         return "\n".join(output)
 

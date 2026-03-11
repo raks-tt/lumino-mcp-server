@@ -376,6 +376,27 @@ def extract_log_patterns(log_lines: List[str], focus_areas: List[str], max_patte
                     for match in matches:
                         if len(patterns[area]) >= max_patterns_per_area:
                             break
+                        matched_text = match if isinstance(match, str) else str(match)
+
+                        # Deduplicate: check if a similar pattern was already captured
+                        # Use the matched_text as a signature (strip variable parts like IPs/ports)
+                        dedup_sig = re.sub(r'\d+\.\d+\.\d+\.\d+:\d+', '<ip:port>', matched_text)
+                        dedup_sig = re.sub(r'[0-9a-f]{8,}', '<id>', dedup_sig)
+                        existing_sigs = [
+                            re.sub(r'\d+\.\d+\.\d+\.\d+:\d+', '<ip:port>',
+                            re.sub(r'[0-9a-f]{8,}', '<id>', p.get("matched_text", "")))
+                            for p in patterns[area]
+                        ]
+                        if dedup_sig in existing_sigs:
+                            # Increment count on the existing pattern instead
+                            for p in patterns[area]:
+                                p_sig = re.sub(r'\d+\.\d+\.\d+\.\d+:\d+', '<ip:port>',
+                                        re.sub(r'[0-9a-f]{8,}', '<id>', p.get("matched_text", "")))
+                                if p_sig == dedup_sig:
+                                    p["occurrence_count"] = p.get("occurrence_count", 1) + 1
+                                    break
+                            continue
+
                         # Truncate content to max_content_length
                         truncated_content = line.strip()[:max_content_length]
                         if len(line.strip()) > max_content_length:
@@ -384,8 +405,9 @@ def extract_log_patterns(log_lines: List[str], focus_areas: List[str], max_patte
                             "line_number": line_num,
                             "timestamp": timestamp,
                             "content": truncated_content,
-                            "matched_text": match if isinstance(match, str) else str(match),
-                            "severity": assess_log_severity(line)
+                            "matched_text": matched_text,
+                            "severity": assess_log_severity(line),
+                            "occurrence_count": 1
                         })
 
     return patterns
@@ -580,8 +602,10 @@ def generate_streaming_recommendations(overall_summary: Dict[str, Any], trending
 
     # High issue count recommendations
     total_issues = overall_summary.get("total_issues_found", 0)
-    if total_issues > 100:
+    if total_issues > 50:
         recommendations.append(f"High issue count detected ({total_issues}). Consider reviewing application stability.")
+    elif total_issues > 10:
+        recommendations.append(f"Moderate issue count ({total_issues}). Review error patterns for recurring problems.")
 
     # Trending pattern recommendations
     trending_up = trending_patterns.get("trending_up", {})
@@ -601,7 +625,10 @@ def generate_streaming_recommendations(overall_summary: Dict[str, Any], trending
             recommendations.append(f"Frequent error pattern detected: '{error}' ({count} occurrences)")
 
     if not recommendations:
-        recommendations.append("No critical patterns detected. System appears stable.")
+        if total_issues == 0:
+            recommendations.append("No critical patterns detected. System appears stable.")
+        else:
+            recommendations.append(f"{total_issues} issue(s) detected but no critical patterns identified. Review logs for details.")
 
     return recommendations
 
