@@ -7962,11 +7962,48 @@ async def automated_triage_rca_report_generator(
         if not failure_context["found"]:
             report["investigation_summary"]["failure_type"] = "Not Found"
             report["investigation_summary"]["severity"] = "Low"
+            report["investigation_summary"]["search_note"] = failure_context.get(
+                "search_note", f"Resource '{failure_identifier}' not found in any namespace"
+            )
+            report["investigation_summary"]["namespaces_searched"] = failure_context.get("namespaces_searched", [])
+            report["remediation_plan"] = {
+                "immediate_actions": [
+                    f"Verify the resource name '{failure_identifier}' is correct",
+                    "The resource may have been garbage collected by Tekton pruner",
+                    "Try using KubeArchive to retrieve archived logs: kubectl ka logs pipelineruns/<name> -n <namespace> --host https://<kubearchive-host>",
+                    "Check if there are related events: kubectl get events -n <namespace> --field-selector involvedObject.name=<name>",
+                ],
+                "preventive_measures": [
+                    "Investigate sooner after failures (before GC runs)",
+                    "Consider increasing Tekton resource retention period",
+                ]
+            }
             return report
 
+        # Handle GC'd resources found via events
+        gc_detected = failure_context.get("gc_detected", False)
         target_namespace = failure_context["namespace"]
         failure_type = failure_context["type"]
         report["investigation_summary"]["failure_type"] = failure_type
+
+        if gc_detected:
+            report["investigation_summary"]["gc_detected"] = True
+            report["investigation_summary"]["note"] = (
+                f"Resource was garbage collected but {failure_context.get('event_count', 0)} "
+                f"event(s) were found. Analysis is based on available event data."
+            )
+            # Populate timeline from the events we found
+            gc_events = failure_context.get("events", [])
+            report["failure_timeline"] = [
+                {
+                    "timestamp": ev.get("last_timestamp", "unknown"),
+                    "event": ev.get("reason", "unknown"),
+                    "message": ev.get("message", ""),
+                    "type": ev.get("type", "Normal"),
+                    "source": "kubernetes_event"
+                }
+                for ev in gc_events
+            ]
 
         # Step 2: Core failure analysis based on type
         if failure_type == "pipelinerun":
@@ -7980,7 +8017,11 @@ async def automated_triage_rca_report_generator(
         timeline_events = []
         if generate_timeline:
             timeline_events = await build_failure_timeline(target_namespace, failure_identifier, time_hours, smart_get_namespace_events, logger)
-            report["failure_timeline"] = timeline_events
+            if timeline_events:
+                report["failure_timeline"] = timeline_events
+            # If no new timeline events found but we have GC events, keep those
+            elif not report.get("failure_timeline"):
+                report["failure_timeline"] = []
 
         # Step 4: Correlate with related failures
         related_failures = []
