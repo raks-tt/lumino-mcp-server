@@ -8153,7 +8153,7 @@ async def check_cluster_certificate_health(
                                                     )
                                                 },
                                                 "usage": {
-                                                    "is_ca": 'ca' in key.lower() or cert_info.get('subject_cn') == cert_info.get('issuer_cn'),
+                                                    "is_ca": cert_info.get('is_ca', False) or 'ca' in key.lower(),
                                                     "is_client": 'client' in key.lower(),
                                                     "is_server": 'server' in key.lower() or 'tls' in key.lower(),
                                                     "san_domains": cert_info.get('san', [])
