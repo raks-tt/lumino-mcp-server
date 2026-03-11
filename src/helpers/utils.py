@@ -334,9 +334,11 @@ def format_summary_output(resource_obj: Any, resource_type: str, name: str, name
         else:
             resource_dict = resource_obj
 
+        cluster_scoped_types = ['node', 'namespace', 'persistentvolume', 'pv', 'storageclass', 'clustertask']
         output = [f"=== {resource_type.upper()} SUMMARY ==="]
         output.append(f"Name: {name}")
-        output.append(f"Namespace: {namespace}")
+        if resource_type not in cluster_scoped_types:
+            output.append(f"Namespace: {namespace}")
 
         metadata = resource_dict.get('metadata', {})
 
@@ -393,6 +395,29 @@ def format_summary_output(resource_obj: Any, resource_type: str, name: str, name
                 output.append(f"Started: {start_time}")
             if completion_time:
                 output.append(f"Completed: {completion_time}")
+
+        elif resource_type == 'node':
+            # Node-specific summary
+            capacity = status.get('capacity', {})
+            allocatable = status.get('allocatable', {})
+            if capacity:
+                output.append(f"CPU: {allocatable.get('cpu', '?')}/{capacity.get('cpu', '?')} (allocatable/capacity)")
+                output.append(f"Memory: {allocatable.get('memory', '?')}/{capacity.get('memory', '?')}")
+                output.append(f"Pods: {allocatable.get('pods', '?')}/{capacity.get('pods', '?')}")
+            node_info = status.get('node_info', {})
+            if node_info:
+                output.append(f"Kubelet: {node_info.get('kubelet_version', 'unknown')}")
+                output.append(f"OS: {node_info.get('os_image', 'unknown')}")
+                output.append(f"Container Runtime: {node_info.get('container_runtime_version', 'unknown')}")
+            # Show roles from labels
+            roles = [k.replace('node-role.kubernetes.io/', '') for k in labels if k.startswith('node-role.kubernetes.io/')]
+            if roles:
+                output.append(f"Roles: {', '.join(roles)}")
+            # Taints
+            taints = spec.get('taints', [])
+            if taints:
+                taint_strs = [f"{t.get('key', '?')}={t.get('value', '')}:{t.get('effect', '?')}" for t in taints[:3]]
+                output.append(f"Taints: {', '.join(taint_strs)}")
 
         elif resource_type in ['pipeline', 'task']:
             # Tekton pipeline/task summary
