@@ -1372,47 +1372,75 @@ class LogMetricsIntegrator:
         self.events = events
 
     async def correlate_with_logs(self, namespace: str, time_window: str = "2h") -> Dict[str, Any]:
-        """Correlate events with log data."""
+        """Correlate events with log data by extracting log-relevant patterns from events."""
 
         try:
-            # This would need to be imported from the main server
-            # For now, return a placeholder
+            correlations = []
+            log_insights = []
+
+            # Extract error-related events that would correlate with log patterns
+            error_events = [e for e in self.events if e.get("severity") in ("HIGH", "CRITICAL")]
+            if error_events:
+                log_insights.append(f"{len(error_events)} high/critical severity events may have corresponding log entries")
+                # Group by category for correlation
+                categories = {}
+                for e in error_events:
+                    cat = e.get("category", "unknown")
+                    categories[cat] = categories.get(cat, 0) + 1
+                for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True)[:5]:
+                    correlations.append({
+                        "event_category": cat,
+                        "event_count": count,
+                        "suggestion": f"Check pod logs for {cat.lower()}-related errors"
+                    })
+
+            if not log_insights:
+                log_insights.append("No high-severity events to correlate with logs")
+                log_insights.append("Use smart_summarize_pod_logs or semantic_log_search for direct log analysis")
+
             return {
-                "log_correlation": "available",
-                "correlations": [],
-                "integration_insights": ["Log correlation functionality available"]
+                "log_correlation": "event_based",
+                "correlations": correlations,
+                "integration_insights": log_insights
             }
 
         except Exception as e:
             return {"log_correlation": "error", "error": str(e)}
 
     async def correlate_with_metrics(self, namespace: str) -> Dict[str, Any]:
-        """Correlate events with metrics data."""
+        """Correlate events with metrics data.
 
-        # Simulated metrics correlation
-        import random
-
-        metrics_patterns = {
-            "cpu_usage": {"avg": random.uniform(20, 95), "max": random.uniform(80, 100)},
-            "memory_usage": {"avg": random.uniform(30, 90), "max": random.uniform(85, 100)},
-            "network_io": {"bytes_in": random.randint(1000000, 10000000)},
-        }
+        Returns available event-based metrics insights without simulated data.
+        Real Prometheus metrics should be queried separately via the prometheus_query tool.
+        """
 
         correlations = []
 
-        # Find CPU correlations
-        high_cpu_events = [e for e in self.events if "cpu" in e.get("event_string", "").lower()]
-        if high_cpu_events and metrics_patterns["cpu_usage"]["avg"] > 80:
-            correlations.append({
-                "type": "cpu_correlation",
-                "strength": 0.8,
-                "description": f"{len(high_cpu_events)} CPU-related events with {metrics_patterns['cpu_usage']['avg']:.1f}% avg CPU"
-            })
+        # Analyze events for resource-related patterns instead of using fake metrics
+        resource_events = {
+            "cpu": [e for e in self.events if any(kw in e.get("event_string", "").lower() for kw in ["cpu", "throttl", "resource limit"])],
+            "memory": [e for e in self.events if any(kw in e.get("event_string", "").lower() for kw in ["memory", "oom", "evict"])],
+            "network": [e for e in self.events if any(kw in e.get("event_string", "").lower() for kw in ["network", "connection", "timeout", "dns"])],
+        }
+
+        for resource_type, events in resource_events.items():
+            if events:
+                correlations.append({
+                    "type": f"{resource_type}_event_correlation",
+                    "event_count": len(events),
+                    "description": f"{len(events)} {resource_type}-related event(s) detected",
+                    "sample_events": [e.get("event_string", "")[:150] for e in events[:3]]
+                })
 
         return {
-            "metrics_correlation": "simulated",
+            "metrics_correlation": "event_based",
             "correlations": correlations,
-            "metrics_summary": metrics_patterns
+            "event_resource_summary": {
+                "cpu_related_events": len(resource_events["cpu"]),
+                "memory_related_events": len(resource_events["memory"]),
+                "network_related_events": len(resource_events["network"]),
+            },
+            "note": "For real-time CPU/memory/disk metrics, use the prometheus_query tool directly"
         }
 
 
