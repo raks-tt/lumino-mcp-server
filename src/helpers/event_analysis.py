@@ -1479,9 +1479,10 @@ class RunbookSuggestionEngine:
         return sorted(suggestions, key=lambda x: x["priority"], reverse=True)[:5]
 
     def _initialize_runbook_database(self) -> Dict[str, Dict[str, Any]]:
-        """Initialize the runbook database."""
+        """Initialize the runbook database with generic, Tekton/Konflux, and OpenShift runbooks."""
 
         return {
+            # ── Generic Kubernetes runbooks ──
             "pod_crash_loop": {
                 "title": "Pod Crash Loop Remediation",
                 "steps": [
@@ -1517,7 +1518,157 @@ class RunbookSuggestionEngine:
                 ],
                 "estimated_time": "25-40 minutes",
                 "severity": "HIGH"
-            }
+            },
+            # ── Tekton / Konflux-specific runbooks ──
+            "task_bundle_resolution": {
+                "title": "Tekton Task Bundle Resolution Failure",
+                "steps": [
+                    "Check if the task bundle image exists: skopeo inspect docker://quay.io/konflux-ci/tekton-catalog/task-<name>:<version>",
+                    "Verify the task reference in .tekton/ pipeline YAML matches an available bundle",
+                    "Check if the task version was recently deprecated or removed",
+                    "If using a pinned digest, verify it hasn't been garbage collected from the registry",
+                    "Check Tekton controller logs for bundle fetch errors"
+                ],
+                "estimated_time": "10-15 minutes",
+                "severity": "HIGH",
+                "references": [
+                    "https://konflux.pages.redhat.com/docs/users/troubleshooting/builds.html"
+                ]
+            },
+            "push_snapshot_failure": {
+                "title": "Push Snapshot / OCI Artifact Failure",
+                "steps": [
+                    "Check if the .src source container tag exists (build-source-image may be skipped)",
+                    "Verify the service account has push permissions to the quay.io image repo",
+                    "Check quay.io organization quota and storage limits",
+                    "Verify the image tag format matches what oras resolve expects",
+                    "If 'unauthorized' error, check robot account credentials in the push secret"
+                ],
+                "estimated_time": "10-20 minutes",
+                "severity": "HIGH",
+                "references": [
+                    "https://konflux.pages.redhat.com/docs/users/troubleshooting/releases.html"
+                ]
+            },
+            "trusted_artifact_failure": {
+                "title": "Trusted Artifact Push/Pull Failure",
+                "steps": [
+                    "Verify the build service account has push access to OCI storage",
+                    "Check if the quay.io repo exists for the component",
+                    "For fork PRs, verify the .tekton/ config uses the correct service account",
+                    "Check quay.io rate limits or quota restrictions"
+                ],
+                "estimated_time": "10-15 minutes",
+                "severity": "HIGH",
+                "references": [
+                    "https://konflux.pages.redhat.com/docs/users/troubleshooting/builds.html"
+                ]
+            },
+            "registry_auth_failure": {
+                "title": "Container Registry Authentication Failure",
+                "steps": [
+                    "Check the pull/push secret referenced by the service account",
+                    "Verify robot account credentials in quay.io are not expired",
+                    "Check if the image repository visibility matches expectations (public vs private)",
+                    "Verify the pac-gitauth secret is correctly configured",
+                    "For cross-namespace releases, check the RoleBinding for registry access"
+                ],
+                "estimated_time": "10-15 minutes",
+                "severity": "HIGH",
+                "references": [
+                    "https://konflux.pages.redhat.com/docs/users/troubleshooting/builds.html"
+                ]
+            },
+            "pyxis_registration_failure": {
+                "title": "Pyxis Image Registration Failure",
+                "steps": [
+                    "Check create-pyxis-image task logs for specific API errors",
+                    "Verify Pyxis API credentials are configured in the release plan",
+                    "Check if the image digest format is valid for Pyxis",
+                    "Verify network connectivity to the Pyxis API endpoint"
+                ],
+                "estimated_time": "15-20 minutes",
+                "severity": "MEDIUM",
+                "references": [
+                    "https://gitlab.cee.redhat.com/konflux/docs/sop/-/blob/main/release/release-service.md"
+                ]
+            },
+            "pipeline_timeout": {
+                "title": "Pipeline Timeout or Long-Running Build",
+                "steps": [
+                    "Check which task is taking the longest (usually buildah or prefetch-dependencies)",
+                    "Verify Kueue workload admission - check if PLR was pending in queue",
+                    "Check if the build node has sufficient CPU/memory available",
+                    "For multi-platform builds, check if remote builder machines are available",
+                    "Review pipeline timeout setting (default 2h for builds)"
+                ],
+                "estimated_time": "15-25 minutes",
+                "severity": "MEDIUM",
+                "references": [
+                    "https://gitlab.cee.redhat.com/konflux/docs/sop/-/blob/main/infra/queue/queue.md"
+                ]
+            },
+            # ── OpenShift runbook links ──
+            "etcd_issues": {
+                "title": "etcd Cluster Health Issues",
+                "steps": [
+                    "Check etcd pod logs for leader election or compaction errors",
+                    "Monitor etcd disk latency and IOPS",
+                    "Review etcd defragmentation schedule",
+                    "Check cluster operator status for etcd degradation"
+                ],
+                "estimated_time": "20-30 minutes",
+                "severity": "CRITICAL",
+                "references": [
+                    "https://github.com/openshift/runbooks/tree/master/alerts/cluster-etcd-operator",
+                    "https://docs.openshift.com/container-platform/latest/scalability_and_performance/recommended-performance-scale-practices/recommended-etcd-practices.html"
+                ]
+            },
+            "node_not_ready": {
+                "title": "Node Not Ready",
+                "steps": [
+                    "Check node conditions: kubectl get node <name> -o yaml",
+                    "Review kubelet logs on the affected node",
+                    "Check for disk pressure, memory pressure, or PID pressure",
+                    "Verify network connectivity to the API server from the node"
+                ],
+                "estimated_time": "15-30 minutes",
+                "severity": "CRITICAL",
+                "references": [
+                    "https://github.com/openshift/runbooks/tree/master/alerts/machine-config-operator",
+                    "https://docs.openshift.com/container-platform/latest/nodes/nodes/nodes-nodes-working.html"
+                ]
+            },
+            "certificate_issues": {
+                "title": "TLS Certificate Issues",
+                "steps": [
+                    "Check certificate expiry dates across the cluster",
+                    "Review certificate rotation status",
+                    "Check for TLS handshake errors in ingress controller logs",
+                    "Verify cert-manager or cluster certificate operator health"
+                ],
+                "estimated_time": "20-40 minutes",
+                "severity": "HIGH",
+                "references": [
+                    "https://docs.openshift.com/container-platform/latest/security/certificate_types_descriptions/index.html",
+                    "https://github.com/openshift/runbooks/tree/master/alerts/cluster-kube-apiserver-operator"
+                ]
+            },
+            "machine_config_degraded": {
+                "title": "MachineConfigPool Degraded",
+                "steps": [
+                    "Check MachineConfigPool status and degraded message",
+                    "Identify which nodes are not updated",
+                    "Review machine-config-daemon logs on affected nodes",
+                    "Check if a recent MachineConfig change caused the degradation"
+                ],
+                "estimated_time": "20-30 minutes",
+                "severity": "HIGH",
+                "references": [
+                    "https://github.com/openshift/runbooks/tree/master/alerts/machine-config-operator",
+                    "https://docs.openshift.com/container-platform/latest/post_installation_configuration/machine-configuration-tasks.html"
+                ]
+            },
         }
 
     def _categorize_issues(self) -> Dict[str, float]:
@@ -1532,21 +1683,89 @@ class RunbookSuggestionEngine:
         # Analyze event patterns
         all_text = " ".join([e.get("event_string", "") for e in self.events]).lower()
 
-        # Pod crash issues
-        crash_indicators = ["crash", "crashloopbackoff", "exit", "failed", "restart"]
-        crash_score = sum(all_text.count(indicator) for indicator in crash_indicators) / total_events
-        if crash_score > 0.1:
-            issue_scores["pod_crash_loop"] = min(1.0, crash_score * 2)
+        # ── Tekton / Konflux-specific issues (check first for specificity) ──
+
+        # Task bundle resolution failures
+        bundle_indicators = ["failed to resolve step ref", "failed to resolve task", "bundle", "resolver"]
+        bundle_score = sum(all_text.count(ind) for ind in bundle_indicators) / total_events
+        if bundle_score > 0.05:
+            issue_scores["task_bundle_resolution"] = min(1.0, bundle_score * 3)
+
+        # Push snapshot / OCI artifact failures
+        push_indicators = ["push-snapshot", "oras resolve", "push_snapshot", "not found"]
+        push_score = sum(all_text.count(ind) for ind in push_indicators) / total_events
+        if push_score > 0.05:
+            issue_scores["push_snapshot_failure"] = min(1.0, push_score * 3)
+
+        # Trusted artifact failures
+        ta_indicators = ["create-trusted-artifact", "use-trusted-artifact", "trusted artifact"]
+        ta_score = sum(all_text.count(ind) for ind in ta_indicators) / total_events
+        if ta_score > 0.05:
+            issue_scores["trusted_artifact_failure"] = min(1.0, ta_score * 3)
+
+        # Registry auth failures
+        auth_indicators = ["unauthorized", "access denied", "forbidden", "authentication required"]
+        auth_score = sum(all_text.count(ind) for ind in auth_indicators) / total_events
+        if auth_score > 0.05:
+            issue_scores["registry_auth_failure"] = min(1.0, auth_score * 3)
+
+        # Pyxis registration failures
+        pyxis_indicators = ["create-pyxis-image", "pyxis", "step-create-pyxis"]
+        pyxis_score = sum(all_text.count(ind) for ind in pyxis_indicators) / total_events
+        if pyxis_score > 0.05:
+            issue_scores["pyxis_registration_failure"] = min(1.0, pyxis_score * 3)
+
+        # Pipeline timeout / long-running
+        timeout_indicators = ["timed out", "deadline exceeded", "timeout", "pipelinerun was stopping"]
+        timeout_score = sum(all_text.count(ind) for ind in timeout_indicators) / total_events
+        if timeout_score > 0.05:
+            issue_scores["pipeline_timeout"] = min(1.0, timeout_score * 2.5)
+
+        # ── OpenShift-specific issues ──
+
+        # etcd issues
+        etcd_indicators = ["etcd", "leader election", "compaction", "etcdserver"]
+        etcd_score = sum(all_text.count(ind) for ind in etcd_indicators) / total_events
+        if etcd_score > 0.05:
+            issue_scores["etcd_issues"] = min(1.0, etcd_score * 3)
+
+        # Node not ready
+        node_indicators = ["nodenotready", "node not ready", "notready", "disk pressure", "memory pressure"]
+        node_score = sum(all_text.count(ind) for ind in node_indicators) / total_events
+        if node_score > 0.05:
+            issue_scores["node_not_ready"] = min(1.0, node_score * 3)
+
+        # Certificate issues
+        cert_indicators = ["certificate expir", "tls handshake", "x509", "cert-manager", "certificate rotation"]
+        cert_score = sum(all_text.count(ind) for ind in cert_indicators) / total_events
+        if cert_score > 0.05:
+            issue_scores["certificate_issues"] = min(1.0, cert_score * 3)
+
+        # MachineConfigPool degraded
+        mcp_indicators = ["machineconfigpool", "machine-config", "mcdaemonstate", "degraded machine"]
+        mcp_score = sum(all_text.count(ind) for ind in mcp_indicators) / total_events
+        if mcp_score > 0.05:
+            issue_scores["machine_config_degraded"] = min(1.0, mcp_score * 3)
+
+        # ── Generic Kubernetes issues (fallback) ──
+
+        # Pod crash issues — only if no Tekton-specific match was found
+        if not any(k in issue_scores for k in ["task_bundle_resolution", "push_snapshot_failure",
+                                                 "trusted_artifact_failure", "registry_auth_failure"]):
+            crash_indicators = ["crash", "crashloopbackoff", "exit", "failed", "restart"]
+            crash_score = sum(all_text.count(ind) for ind in crash_indicators) / total_events
+            if crash_score > 0.1:
+                issue_scores["pod_crash_loop"] = min(1.0, crash_score * 2)
 
         # Memory issues
-        memory_indicators = ["oom", "memory", "killed", "evicted"]
-        memory_score = sum(all_text.count(indicator) for indicator in memory_indicators) / total_events
+        memory_indicators = ["oom", "oomkilled", "out of memory", "killed", "evicted"]
+        memory_score = sum(all_text.count(ind) for ind in memory_indicators) / total_events
         if memory_score > 0.05:
             issue_scores["memory_exhaustion"] = min(1.0, memory_score * 3)
 
         # Network issues
-        network_indicators = ["network", "dns", "connection", "timeout", "unreachable"]
-        network_score = sum(all_text.count(indicator) for indicator in network_indicators) / total_events
+        network_indicators = ["network", "dns", "connection refused", "unreachable"]
+        network_score = sum(all_text.count(ind) for ind in network_indicators) / total_events
         if network_score > 0.05:
             issue_scores["network_connectivity"] = min(1.0, network_score * 2.5)
 
@@ -1562,7 +1781,17 @@ class RunbookSuggestionEngine:
         explanations = {
             "pod_crash_loop": "Multiple pod failures and restart events detected",
             "memory_exhaustion": "OOM kills and memory-related events identified",
-            "network_connectivity": "Network timeouts and connectivity issues found"
+            "network_connectivity": "Network timeouts and connectivity issues found",
+            "task_bundle_resolution": "Tekton task bundle resolution errors detected (failed to resolve step ref)",
+            "push_snapshot_failure": "Push snapshot or OCI artifact resolution failures detected",
+            "trusted_artifact_failure": "Trusted artifact push/pull errors detected in build pipeline",
+            "registry_auth_failure": "Container registry authentication or authorization errors detected",
+            "pyxis_registration_failure": "Pyxis image registration failures detected in release pipeline",
+            "pipeline_timeout": "Pipeline timeout or long-running build detected",
+            "etcd_issues": "etcd cluster health events detected (leader election, compaction, or latency)",
+            "node_not_ready": "Node readiness issues detected (NotReady, disk/memory pressure)",
+            "certificate_issues": "TLS certificate or handshake errors detected",
+            "machine_config_degraded": "MachineConfigPool degradation events detected",
         }
 
         return explanations.get(issue_type, "Pattern matching indicates relevance")
