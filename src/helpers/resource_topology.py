@@ -320,6 +320,8 @@ async def follow_lifecycle_chain(
     import json
 
     lifecycle = {
+        "application": None,
+        "component": None,
         "snapshots": [],
         "integration_tests": [],
         "releases": [],
@@ -348,6 +350,17 @@ async def follow_lifecycle_chain(
         if not snapshot_data:
             continue
         lifecycle["snapshots"].append(snapshot_data)
+
+        # ── Step 2b: Resolve Application and Component context ──
+        if not lifecycle["application"]:
+            app_name = snapshot_data.get("application")
+            if app_name:
+                lifecycle["application"] = await _resolve_application(custom_api, namespace, app_name, logger)
+
+        if not lifecycle["component"]:
+            comp_name = labels.get("appstudio.openshift.io/component")
+            if comp_name:
+                lifecycle["component"] = await _resolve_component(custom_api, namespace, comp_name, logger)
 
         # ── Step 3: Snapshot → Integration Tests ──
         test_entries = _extract_test_info_from_snapshot(snapshot_data)
@@ -401,6 +414,89 @@ async def _resolve_plr(custom_api, namespace: str, plr_name: str, logger=None) -
         if logger:
             logger.debug(f"Failed to resolve PLR {plr_name} in {namespace}: {e}")
         return None
+
+
+async def _resolve_application(custom_api, namespace: str, app_name: str, logger=None) -> Optional[Dict]:
+    """Fetch an Application resource and extract key fields."""
+    try:
+        app = custom_api.get_namespaced_custom_object(
+            group="appstudio.redhat.com", version="v1alpha1",
+            namespace=namespace, plural="applications", name=app_name
+        )
+        spec = app.get("spec", {})
+
+        # Count components belonging to this application
+        component_count = 0
+        try:
+            comp_list = custom_api.list_namespaced_custom_object(
+                group="appstudio.redhat.com", version="v1alpha1",
+                namespace=namespace, plural="components",
+                label_selector=f"appstudio.openshift.io/application={app_name}"
+            )
+            component_count = len(comp_list.get("items", []))
+        except Exception:
+            pass
+
+        return {
+            "name": app_name,
+            "namespace": namespace,
+            "display_name": spec.get("displayName", app_name),
+            "component_count": component_count,
+        }
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve application {app_name} in {namespace}: {e}")
+        return {"name": app_name, "namespace": namespace, "status": "not_found"}
+
+
+async def _resolve_component(custom_api, namespace: str, comp_name: str, logger=None) -> Optional[Dict]:
+    """Fetch a Component resource and extract key fields."""
+    try:
+        comp = custom_api.get_namespaced_custom_object(
+            group="appstudio.redhat.com", version="v1alpha1",
+            namespace=namespace, plural="components", name=comp_name
+        )
+        spec = comp.get("spec", {})
+        status = comp.get("status", {})
+        annotations = comp.get("metadata", {}).get("annotations", {})
+
+        # Parse build pipeline annotation
+        build_pipeline = ""
+        try:
+            import json
+            pipeline_info = json.loads(annotations.get("build.appstudio.openshift.io/pipeline", "{}"))
+            build_pipeline = pipeline_info.get("name", "")
+        except Exception:
+            pass
+
+        # Parse PaC status
+        pac_enabled = False
+        try:
+            import json
+            pac_info = json.loads(annotations.get("build.appstudio.openshift.io/status", "{}"))
+            pac_enabled = pac_info.get("pac", {}).get("state") == "enabled"
+        except Exception:
+            pass
+
+        git_source = spec.get("source", {}).get("git", {})
+
+        return {
+            "name": comp_name,
+            "namespace": namespace,
+            "application": spec.get("application", ""),
+            "source_url": git_source.get("url", ""),
+            "revision": git_source.get("revision", ""),
+            "dockerfile": git_source.get("dockerfileUrl", ""),
+            "context": git_source.get("context", ""),
+            "build_pipeline": build_pipeline,
+            "pac_enabled": pac_enabled,
+            "container_image": spec.get("containerImage", "")[:100],
+            "last_built_commit": status.get("lastBuiltCommit", "")[:12],
+        }
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve component {comp_name} in {namespace}: {e}")
+        return {"name": comp_name, "namespace": namespace, "status": "not_found"}
 
 
 async def _resolve_snapshot(custom_api, namespace: str, snapshot_name: str, source_plr: Dict, logger=None) -> Optional[Dict]:
