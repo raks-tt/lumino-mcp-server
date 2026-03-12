@@ -777,17 +777,27 @@ def calculate_relevance_score_from_string(event_str: str, focus_areas: List[str]
 def extract_timestamp_from_string(event_str: str) -> datetime:
     """Extract timestamp from event string."""
 
-    # Try to find ISO timestamp
+    # Try to find ISO timestamp (with T separator)
     iso_pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)'
     match = re.search(iso_pattern, event_str)
 
     if match:
         try:
             timestamp_str = match.group(1)
-            # Handle timezone
             if timestamp_str.endswith('Z'):
                 timestamp_str = timestamp_str[:-1] + '+00:00'
             return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+        except ValueError:
+            pass
+
+    # Try space-separated format: [2026-03-11 04:44:36+00:00] or 2026-03-11 04:44:36+00:00
+    space_pattern = r'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:\d{2})?)'
+    match = re.search(space_pattern, event_str)
+
+    if match:
+        try:
+            timestamp_str = match.group(1) + "T" + match.group(2)
+            return datetime.fromisoformat(timestamp_str)
         except ValueError:
             pass
 
@@ -1324,9 +1334,22 @@ class MLPatternDetector:
         }
 
         try:
-            # Analyze trending patterns
-            recent_events = [e for e in self.events if
-                           (datetime.now() - e.get("timestamp", datetime.now())).total_seconds() < 3600]  # Last hour
+            # Analyze trending patterns — use timezone-aware now() to match parsed timestamps
+            now = datetime.now()
+            recent_events = []
+            for e in self.events:
+                ts = e.get("timestamp", now)
+                try:
+                    # Handle both naive and aware datetimes
+                    if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
+                        from datetime import timezone
+                        diff = (datetime.now(timezone.utc) - ts).total_seconds()
+                    else:
+                        diff = (now - ts).total_seconds()
+                    if diff < 3600:
+                        recent_events.append(e)
+                except (TypeError, ValueError):
+                    pass
 
             if len(recent_events) > len(self.events) * 0.5:  # More than 50% of events in last hour
                 indicators["trending_issues"].append("High event frequency in recent period")
@@ -1878,6 +1901,19 @@ def assess_overall_risk(analytics_result: Dict[str, Any]) -> Dict[str, Any]:
         risk_level = "MEDIUM"
     else:
         risk_level = "LOW"
+
+    # Ensure overall risk is consistent with escalation risk from predictive indicators
+    risk_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+    if "predictive_indicators" in ml_patterns:
+        pred = ml_patterns["predictive_indicators"]
+        if isinstance(pred, dict):
+            escalation_risk = pred.get("escalation_risk", "LOW")
+            # Overall risk should be at least one level below escalation risk
+            min_risk_for_escalation = {"LOW": "LOW", "MEDIUM": "LOW", "HIGH": "MEDIUM", "CRITICAL": "HIGH"}
+            min_level = min_risk_for_escalation.get(escalation_risk, "LOW")
+            if risk_rank.get(risk_level, 0) < risk_rank.get(min_level, 0):
+                risk_level = min_level
+                risk_factors.append(f"Risk elevated to {min_level} for consistency with {escalation_risk} escalation risk")
 
     return {
         "overall_risk_level": risk_level,

@@ -1046,7 +1046,9 @@ def get_kubernetes_resource(
                        storageclass, hpa (horizontalpodautoscaler),
                        pipelinerun, taskrun, pipeline, task, clustertask,
                        triggertemplate, triggerbinding, eventlistener,
-                       podmonitor, servicemonitor, prometheusrule, alertmanager.
+                       podmonitor, servicemonitor, prometheusrule, alertmanager,
+                       application, component, snapshot, release, releaseplan,
+                       releaseplanadmission, integrationtestscenario.
         name: Resource name.
         namespace: Namespace (default: "default").
         output_format: "summary", "detailed", or "yaml" (default: "summary").
@@ -1126,6 +1128,16 @@ def get_kubernetes_resource(
         admission_resources = {
             'validatingadmissionwebhook': ('validatingadmissionwebhooks', 'admissionregistration.k8s.io/v1'),
             'mutatingadmissionwebhook': ('mutatingadmissionwebhooks', 'admissionregistration.k8s.io/v1')
+        }
+
+        konflux_resources = {
+            'application': ('applications', 'appstudio.redhat.com/v1alpha1'),
+            'component': ('components', 'appstudio.redhat.com/v1alpha1'),
+            'snapshot': ('snapshots', 'appstudio.redhat.com/v1alpha1'),
+            'release': ('releases', 'appstudio.redhat.com/v1alpha1'),
+            'releaseplan': ('releaseplans', 'appstudio.redhat.com/v1alpha1'),
+            'releaseplanadmission': ('releaseplanadmissions', 'appstudio.redhat.com/v1alpha1'),
+            'integrationtestscenario': ('integrationtestscenarios', 'appstudio.redhat.com/v1beta2'),
         }
 
         resource_obj = None
@@ -1229,13 +1241,25 @@ def get_kubernetes_resource(
                 name=name
             )
 
+        elif resource_type in konflux_resources:
+            method_name, api_version = konflux_resources[resource_type]
+            group, version = api_version.split('/')
+            resource_obj = k8s_custom_api.get_namespaced_custom_object(
+                group=group,
+                version=version,
+                namespace=namespace,
+                plural=method_name,
+                name=name
+            )
+
         else:
             supported_types = (
                 list(core_resources.keys()) + list(apps_resources.keys()) +
                 list(batch_resources.keys()) + list(networking_resources.keys()) +
                 list(storage_resources.keys()) + list(autoscaling_resources.keys()) +
                 list(tekton_resources.keys()) + list(tekton_triggers_resources.keys()) +
-                list(monitoring_resources.keys()) + list(admission_resources.keys())
+                list(monitoring_resources.keys()) + list(admission_resources.keys()) +
+                list(konflux_resources.keys())
             )
             return f"Error: Unsupported resource type '{resource_type}'. Supported types: {', '.join(sorted(supported_types))}"
 

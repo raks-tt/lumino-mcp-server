@@ -1104,7 +1104,31 @@ def determine_root_cause(analysis_results: Dict[str, Any]) -> str:
         elif category == "crash":
             return "Container crash loop (CrashLoopBackOff) - container is repeatedly crashing on startup"
         elif category == "image":
-            return "Image pull failure (ImagePullBackOff) - unable to pull container image from registry"
+            # Verify this is an actual image pull failure, not just a log mentioning "image"
+            # Check if error_patterns contain definitive image pull indicators
+            actual_errors = []
+            for task in analysis_results.get("failed_tasks", []):
+                actual_errors.extend(task.get("error_patterns", []))
+            errors_text = " ".join(actual_errors).lower()
+            image_pull_indicators = ["imagepullbackoff", "errimagepull", "failed to pull image", "pull access denied"]
+            if any(ind in errors_text for ind in image_pull_indicators):
+                return "Image pull failure (ImagePullBackOff) - unable to pull container image from registry"
+            # If "image" matched from log context but errors point to a step/build failure, use step details
+            all_failed_steps = []
+            for task in analysis_results.get("failed_tasks", []):
+                for step in task.get("failed_steps", []):
+                    all_failed_steps.append(step)
+            if all_failed_steps:
+                step_details = []
+                for step in all_failed_steps[:3]:
+                    step_name = step.get("step_name", "unknown")
+                    exit_code = step.get("exit_code", "?")
+                    step_details.append(f"'{step_name}' (exit code {exit_code})")
+                steps_str = ", ".join(step_details)
+                first_error = actual_errors[0][:120] if actual_errors else ""
+                context = f" - {first_error}" if first_error else ""
+                return f"Task step failure - step {steps_str} exited with non-zero code{context}"
+            return "Image-related error - check container image references and registry access"
         elif category == "scheduling":
             return "Pod scheduling failure - insufficient resources or node constraints preventing scheduling"
         elif category == "storage":
