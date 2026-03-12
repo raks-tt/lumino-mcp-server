@@ -125,6 +125,7 @@ from helpers import (
     # Resource topology helpers
     get_multi_cluster_clients,
     correlate_pipeline_events,
+    follow_lifecycle_chain,
     track_artifacts,
     analyze_bottlenecks,
     # Machine config pool helpers
@@ -9122,15 +9123,77 @@ async def pipeline_tracer(
                 except Exception as e:
                     logger.debug(f"Failed to calculate total duration: {e}")
 
-        # Determine overall status
+        # Follow lifecycle chain (snapshots → tests → releases → release pipelines)
+        lifecycle = {}
+        if pipeline_flow:
+            try:
+                lifecycle = await follow_lifecycle_chain(
+                    pipeline_flow=pipeline_flow,
+                    custom_api=k8s_custom_api,
+                    core_api=k8s_core_api,
+                    trace_depth=trace_depth,
+                    logger=logger
+                )
+                logger.info(
+                    f"Lifecycle chain: {len(lifecycle.get('snapshots', []))} snapshots, "
+                    f"{len(lifecycle.get('integration_tests', []))} tests, "
+                    f"{len(lifecycle.get('releases', []))} releases, "
+                    f"{len(lifecycle.get('release_pipelines', []))} release PLRs, "
+                    f"{len(lifecycle.get('nudge_cascade', []))} nudge cascades"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to follow lifecycle chain: {e}")
+                lifecycle = {"error": str(e)[:200]}
+
+        # Determine overall status (include lifecycle in assessment)
         if not pipeline_flow:
             overall_status = "not_found"
-        elif all(p["status"] in ["Succeeded", "Completed"] for p in pipeline_flow):
-            overall_status = "succeeded"
-        elif any(p["status"] in ["Failed", "Error"] for p in pipeline_flow):
-            overall_status = "failed"
         else:
-            overall_status = "in_progress"
+            # Check build PLRs
+            builds_ok = all(p["status"] in ["Succeeded", "Completed"] for p in pipeline_flow)
+            builds_failed = any(p["status"] in ["Failed", "Error"] for p in pipeline_flow)
+
+            # Check release status from lifecycle
+            releases = lifecycle.get("releases", [])
+            release_failed = any(r.get("status") == "Failed" for r in releases)
+            release_succeeded = all(r.get("status") == "Succeeded" for r in releases) if releases else True
+
+            if builds_failed:
+                overall_status = "failed"
+            elif release_failed:
+                overall_status = "release_failed"
+            elif builds_ok and release_succeeded:
+                overall_status = "succeeded"
+            else:
+                overall_status = "in_progress"
+
+        # Build stage-level summary
+        stage_summary = {}
+        if pipeline_flow:
+            build_durations = [p.get("completion_time") for p in pipeline_flow if p.get("completion_time")]
+            stage_summary["build"] = {
+                "count": len(pipeline_flow),
+                "status": "succeeded" if all(p["status"] in ["Succeeded", "Completed"] for p in pipeline_flow) else "failed",
+            }
+        if lifecycle.get("integration_tests"):
+            tests = lifecycle["integration_tests"]
+            stage_summary["integration_tests"] = {
+                "count": len(tests),
+                "passed": sum(1 for t in tests if t.get("status") == "TestPassed"),
+                "failed": sum(1 for t in tests if t.get("status") == "TestFail"),
+            }
+        if lifecycle.get("releases"):
+            rels = lifecycle["releases"]
+            stage_summary["releases"] = {
+                "count": len(rels),
+                "succeeded": sum(1 for r in rels if r.get("status") == "Succeeded"),
+                "failed": sum(1 for r in rels if r.get("status") == "Failed"),
+            }
+        if lifecycle.get("nudge_cascade"):
+            stage_summary["nudge_cascade"] = {
+                "count": len(lifecycle["nudge_cascade"]),
+            }
+        summary["stages"] = stage_summary
 
         result = {
             "trace_id": f"{trace_type}:{trace_identifier}",
@@ -9139,6 +9202,7 @@ async def pipeline_tracer(
             "end_time": end_time or (pipeline_flow[-1].get("completion_time") if pipeline_flow else None),
             "overall_status": overall_status,
             "pipeline_flow": pipeline_flow,
+            "lifecycle": lifecycle,
             "artifacts": artifacts,
             "bottlenecks": bottlenecks,
             "summary": summary

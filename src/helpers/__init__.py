@@ -191,6 +191,7 @@ from .resource_topology import (
     get_multi_cluster_clients,
     # Pipeline correlation and tracking
     correlate_pipeline_events,
+    follow_lifecycle_chain,
     matches_trace_identifier,
     get_pipeline_status,
     extract_task_info,
@@ -368,6 +369,7 @@ __all__ = [
     # Resource Topology
     "get_multi_cluster_clients",
     "correlate_pipeline_events",
+    "follow_lifecycle_chain",
     "matches_trace_identifier",
     "get_pipeline_status",
     "extract_task_info",
