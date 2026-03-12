@@ -290,6 +290,562 @@ def in_time_range(pipeline_info: Dict[str, Any], start_time: Optional[str], end_
 
 
 # ============================================================================
+# FULL LIFECYCLE CHAIN FOLLOWING
+# ============================================================================
+
+
+async def follow_lifecycle_chain(
+    pipeline_flow: List[Dict[str, Any]],
+    custom_api,
+    core_api,
+    trace_depth: str = "deep",
+    logger=None
+) -> Dict[str, Any]:
+    """
+    Follow the Konflux lifecycle chain from build PLRs through snapshots,
+    integration tests, releases, and release pipelines.
+
+    Chain: Build PLR → Snapshot → Integration Tests → Release → Managed/Tenant/Final PLR → Nudge Cascade
+
+    Args:
+        pipeline_flow: Initial matched PipelineRuns from correlate_pipeline_events()
+        custom_api: Kubernetes CustomObjectsApi for CRD queries
+        core_api: Kubernetes CoreV1Api
+        trace_depth: "shallow" (snapshots only) or "deep" (full chain)
+        logger: Optional logger
+
+    Returns:
+        Dict with snapshots, integration_tests, releases, release_pipelines, nudge_cascade
+    """
+    import json
+
+    lifecycle = {
+        "application": None,
+        "component": None,
+        "snapshots": [],
+        "integration_tests": [],
+        "releases": [],
+        "release_pipelines": [],
+        "nudge_cascade": [],
+    }
+
+    seen_snapshots = set()
+    seen_releases = set()
+    seen_plrs = set()
+
+    for plr in pipeline_flow:
+        annotations = plr.get("annotations", {})
+        labels = plr.get("labels", {})
+        namespace = plr.get("namespace", "")
+
+        # ── Step 2: Build PLR → Snapshot ──
+        # Check both annotations (build PLRs) and labels (test PLRs) for snapshot reference
+        snapshot_name = annotations.get("appstudio.openshift.io/snapshot") or \
+                        labels.get("appstudio.openshift.io/snapshot")
+        if not snapshot_name or snapshot_name in seen_snapshots:
+            continue
+        seen_snapshots.add(snapshot_name)
+
+        snapshot_data = await _resolve_snapshot(custom_api, namespace, snapshot_name, plr, logger)
+        if not snapshot_data:
+            continue
+        lifecycle["snapshots"].append(snapshot_data)
+
+        # ── Step 2b: Resolve Application and Component context ──
+        if not lifecycle["application"]:
+            app_name = snapshot_data.get("application")
+            if app_name:
+                lifecycle["application"] = await _resolve_application(custom_api, namespace, app_name, logger)
+
+        if not lifecycle["component"]:
+            comp_name = labels.get("appstudio.openshift.io/component")
+            if comp_name:
+                lifecycle["component"] = await _resolve_component(custom_api, namespace, comp_name, logger)
+
+        # ── Step 3: Snapshot → Integration Tests ──
+        test_entries = _extract_test_info_from_snapshot(snapshot_data)
+        for test_entry in test_entries:
+            lifecycle["integration_tests"].append(test_entry)
+            # Optionally fetch the test PLR for task-level details
+            if trace_depth == "deep" and test_entry.get("plr_name"):
+                test_plr_detail = await _resolve_plr(
+                    custom_api, namespace, test_entry["plr_name"], logger
+                )
+                if test_plr_detail:
+                    test_entry["tasks"] = extract_task_info_from_status(test_plr_detail)
+                    test_entry["pipeline"] = test_plr_detail.get("metadata", {}).get("labels", {}).get("tekton.dev/pipeline", "")
+
+        # ── Step 4: Snapshot → Releases ──
+        releases = await _resolve_releases_for_snapshot(custom_api, namespace, snapshot_name, logger)
+        for release in releases:
+            release_key = release.get("name", "")
+            if release_key in seen_releases:
+                continue
+            seen_releases.add(release_key)
+            lifecycle["releases"].append(release)
+
+            # ── Step 5: Release → Managed/Tenant/Final PLRs ──
+            if trace_depth == "deep":
+                release_plrs = await _resolve_release_pipelines(custom_api, release, logger)
+                for rp in release_plrs:
+                    plr_key = f"{rp.get('namespace')}/{rp.get('name')}"
+                    if plr_key not in seen_plrs:
+                        seen_plrs.add(plr_key)
+                        lifecycle["release_pipelines"].append(rp)
+
+        # ── Step 6: Nudge Cascade (deep only) ──
+        if trace_depth == "deep" and snapshot_data.get("nudge_processed"):
+            nudge_entries = await _resolve_nudge_cascade(
+                custom_api, namespace, snapshot_data, lifecycle["releases"], logger
+            )
+            lifecycle["nudge_cascade"].extend(nudge_entries)
+
+    return lifecycle
+
+
+async def _resolve_plr(custom_api, namespace: str, plr_name: str, logger=None) -> Optional[Dict]:
+    """Fetch a single PipelineRun resource."""
+    try:
+        return custom_api.get_namespaced_custom_object(
+            group="tekton.dev", version="v1",
+            namespace=namespace, plural="pipelineruns", name=plr_name
+        )
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve PLR {plr_name} in {namespace}: {e}")
+        return None
+
+
+async def _resolve_application(custom_api, namespace: str, app_name: str, logger=None) -> Optional[Dict]:
+    """Fetch an Application resource and extract key fields."""
+    try:
+        app = custom_api.get_namespaced_custom_object(
+            group="appstudio.redhat.com", version="v1alpha1",
+            namespace=namespace, plural="applications", name=app_name
+        )
+        spec = app.get("spec", {})
+
+        # Count components belonging to this application
+        component_count = 0
+        try:
+            comp_list = custom_api.list_namespaced_custom_object(
+                group="appstudio.redhat.com", version="v1alpha1",
+                namespace=namespace, plural="components",
+                label_selector=f"appstudio.openshift.io/application={app_name}"
+            )
+            component_count = len(comp_list.get("items", []))
+        except Exception:
+            pass
+
+        return {
+            "name": app_name,
+            "namespace": namespace,
+            "display_name": spec.get("displayName", app_name),
+            "component_count": component_count,
+        }
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve application {app_name} in {namespace}: {e}")
+        return {"name": app_name, "namespace": namespace, "status": "not_found"}
+
+
+async def _resolve_component(custom_api, namespace: str, comp_name: str, logger=None) -> Optional[Dict]:
+    """Fetch a Component resource and extract key fields."""
+    try:
+        comp = custom_api.get_namespaced_custom_object(
+            group="appstudio.redhat.com", version="v1alpha1",
+            namespace=namespace, plural="components", name=comp_name
+        )
+        spec = comp.get("spec", {})
+        status = comp.get("status", {})
+        annotations = comp.get("metadata", {}).get("annotations", {})
+
+        # Parse build pipeline annotation
+        build_pipeline = ""
+        try:
+            import json
+            pipeline_info = json.loads(annotations.get("build.appstudio.openshift.io/pipeline", "{}"))
+            build_pipeline = pipeline_info.get("name", "")
+        except Exception:
+            pass
+
+        # Parse PaC status
+        pac_enabled = False
+        try:
+            import json
+            pac_info = json.loads(annotations.get("build.appstudio.openshift.io/status", "{}"))
+            pac_enabled = pac_info.get("pac", {}).get("state") == "enabled"
+        except Exception:
+            pass
+
+        git_source = spec.get("source", {}).get("git", {})
+
+        return {
+            "name": comp_name,
+            "namespace": namespace,
+            "application": spec.get("application", ""),
+            "source_url": git_source.get("url", ""),
+            "revision": git_source.get("revision", ""),
+            "dockerfile": git_source.get("dockerfileUrl", ""),
+            "context": git_source.get("context", ""),
+            "build_pipeline": build_pipeline,
+            "pac_enabled": pac_enabled,
+            "container_image": spec.get("containerImage", "")[:100],
+            "last_built_commit": status.get("lastBuiltCommit", "")[:12],
+        }
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve component {comp_name} in {namespace}: {e}")
+        return {"name": comp_name, "namespace": namespace, "status": "not_found"}
+
+
+async def _resolve_snapshot(custom_api, namespace: str, snapshot_name: str, source_plr: Dict, logger=None) -> Optional[Dict]:
+    """Fetch a Snapshot resource and extract key fields."""
+    import json
+    try:
+        snapshot = custom_api.get_namespaced_custom_object(
+            group="appstudio.redhat.com", version="v1alpha1",
+            namespace=namespace, plural="snapshots", name=snapshot_name
+        )
+        metadata = snapshot.get("metadata", {})
+        annotations = metadata.get("annotations", {})
+        spec = snapshot.get("spec", {})
+        status = snapshot.get("status", {})
+        conditions = status.get("conditions", [])
+
+        # Parse conditions into a simple dict
+        condition_map = {}
+        for c in conditions:
+            condition_map[c.get("type", "")] = {
+                "status": c.get("status"),
+                "reason": c.get("reason"),
+                "message": c.get("message", "")[:200],
+            }
+
+        # Extract components
+        components = []
+        for comp in spec.get("components", []):
+            components.append({
+                "name": comp.get("name", ""),
+                "containerImage": comp.get("containerImage", "")[:100],
+                "git_url": comp.get("source", {}).get("git", {}).get("url", ""),
+                "revision": comp.get("source", {}).get("git", {}).get("revision", "")[:12],
+            })
+
+        return {
+            "name": snapshot_name,
+            "namespace": namespace,
+            "application": spec.get("application", ""),
+            "components": components,
+            "component_count": len(components),
+            "conditions": condition_map,
+            "tests_passed": condition_map.get("AppStudioTestSucceeded", {}).get("status") == "True",
+            "auto_released": condition_map.get("AutoReleased", {}).get("status") == "True",
+            "nudge_processed": annotations.get("build.appstudio.openshift.io/component-nudge-processed") == "true",
+            "triggered_by_plr": source_plr.get("pipeline_run_name", ""),
+            "created_at": metadata.get("creationTimestamp", ""),
+            "_raw_annotations": annotations,  # Kept for test extraction
+        }
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve snapshot {snapshot_name} in {namespace}: {e}")
+        status_msg = "not_found" if "404" in str(e) else "rbac_denied" if "403" in str(e) else str(e)[:80]
+        return {
+            "name": snapshot_name,
+            "namespace": namespace,
+            "status": status_msg,
+            "components": [],
+            "component_count": 0,
+            "conditions": {},
+            "tests_passed": None,
+            "auto_released": None,
+            "nudge_processed": False,
+            "triggered_by_plr": source_plr.get("pipeline_run_name", ""),
+        }
+
+
+def _extract_test_info_from_snapshot(snapshot_data: Dict) -> List[Dict]:
+    """Extract integration test results from snapshot annotations."""
+    import json
+    tests = []
+    raw_annotations = snapshot_data.get("_raw_annotations", {})
+    test_status_str = raw_annotations.get("test.appstudio.openshift.io/status", "[]")
+
+    try:
+        test_statuses = json.loads(test_status_str)
+    except (json.JSONDecodeError, TypeError):
+        return tests
+
+    for test in test_statuses:
+        duration_seconds = None
+        start_time = test.get("startTime")
+        completion_time = test.get("completionTime")
+        if start_time and completion_time:
+            try:
+                from datetime import datetime
+                s = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                e = datetime.fromisoformat(completion_time.replace("Z", "+00:00"))
+                duration_seconds = int((e - s).total_seconds())
+            except Exception:
+                pass
+
+        tests.append({
+            "scenario": test.get("scenario", ""),
+            "status": test.get("status", ""),
+            "plr_name": test.get("testPipelineRunName", ""),
+            "start_time": start_time,
+            "completion_time": completion_time,
+            "duration_seconds": duration_seconds,
+            "snapshot": snapshot_data.get("name", ""),
+        })
+
+    return tests
+
+
+async def _resolve_releases_for_snapshot(custom_api, namespace: str, snapshot_name: str, logger=None) -> List[Dict]:
+    """Find Release resources linked to a snapshot via label."""
+    releases = []
+    try:
+        release_list = custom_api.list_namespaced_custom_object(
+            group="appstudio.redhat.com", version="v1alpha1",
+            namespace=namespace, plural="releases",
+            label_selector=f"release.appstudio.openshift.io/snapshot={snapshot_name}"
+        )
+
+        for release in release_list.get("items", []):
+            metadata = release.get("metadata", {})
+            labels = metadata.get("labels", {})
+            spec = release.get("spec", {})
+            status = release.get("status", {})
+            conditions = status.get("conditions", [])
+
+            condition_map = {}
+            for c in conditions:
+                condition_map[c.get("type", "")] = {
+                    "status": c.get("status"),
+                    "reason": c.get("reason"),
+                    "message": c.get("message", "")[:200],
+                }
+
+            releases.append({
+                "name": metadata.get("name", ""),
+                "namespace": namespace,
+                "snapshot": snapshot_name,
+                "release_plan": spec.get("releasePlan", ""),
+                "grace_period_days": spec.get("gracePeriodDays"),
+                "status": "Succeeded" if condition_map.get("Released", {}).get("status") == "True" else "Failed" if condition_map.get("Released", {}).get("status") == "False" else "InProgress",
+                "conditions": condition_map,
+                "automated": status.get("automated", False),
+                "author": status.get("attribution", {}).get("author", ""),
+                "start_time": status.get("startTime"),
+                "completion_time": status.get("completionTime"),
+                "target": status.get("target", ""),
+                "artifacts": status.get("artifacts", {}),
+                # Pipeline references for step 5
+                "_managed_plr_ref": status.get("managedProcessing", {}).get("pipelineRun"),
+                "_tenant_plr_ref": status.get("tenantProcessing", {}).get("pipelineRun"),
+                "_final_plr_ref": status.get("finalProcessing", {}).get("pipelineRun"),
+            })
+
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to find releases for snapshot {snapshot_name}: {e}")
+
+    return releases
+
+
+async def _resolve_release_pipelines(custom_api, release: Dict, logger=None) -> List[Dict]:
+    """Resolve managed, tenant, and final PLRs from a Release resource."""
+    plrs = []
+    refs = [
+        ("managed", release.get("_managed_plr_ref")),
+        ("tenant", release.get("_tenant_plr_ref")),
+        ("final", release.get("_final_plr_ref")),
+    ]
+
+    for stage, ref in refs:
+        if not ref or "/" not in ref:
+            continue
+        ns, name = ref.split("/", 1)
+
+        try:
+            plr = custom_api.get_namespaced_custom_object(
+                group="tekton.dev", version="v1",
+                namespace=ns, plural="pipelineruns", name=name
+            )
+            status = plr.get("status", {})
+            conditions = status.get("conditions", [])
+            plr_status = "Unknown"
+            plr_message = ""
+            for c in conditions:
+                if c.get("type") == "Succeeded":
+                    plr_status = c.get("reason", "Unknown")
+                    plr_message = c.get("message", "")
+                    break
+
+            # Extract tasks
+            tasks = extract_task_info_from_status(plr)
+
+            # Calculate duration
+            duration_seconds = None
+            start = status.get("startTime")
+            end = status.get("completionTime")
+            if start and end:
+                try:
+                    from datetime import datetime
+                    s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                    e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                    duration_seconds = int((e - s).total_seconds())
+                except Exception:
+                    pass
+
+            plrs.append({
+                "name": name,
+                "namespace": ns,
+                "stage": stage,
+                "pipeline": plr.get("metadata", {}).get("labels", {}).get("tekton.dev/pipeline", ""),
+                "status": plr_status,
+                "message": plr_message[:150],
+                "start_time": start,
+                "completion_time": end,
+                "duration_seconds": duration_seconds,
+                "tasks": tasks,
+                "task_count": len(tasks),
+                "release": release.get("name", ""),
+            })
+
+        except Exception as e:
+            if logger:
+                logger.debug(f"Failed to resolve {stage} PLR {ns}/{name}: {e}")
+            status_msg = "not_found" if "404" in str(e) else "rbac_denied" if "403" in str(e) else str(e)[:60]
+            plrs.append({
+                "name": name,
+                "namespace": ns,
+                "stage": stage,
+                "status": status_msg,
+                "release": release.get("name", ""),
+            })
+
+    return plrs
+
+
+def extract_task_info_from_status(plr: Dict) -> List[Dict]:
+    """Extract task info from a PipelineRun, using childReferences (v1) or taskRuns (v1beta1)."""
+    tasks = []
+
+    # Try childReferences first (Tekton v1 format)
+    child_refs = plr.get("status", {}).get("childReferences", [])
+    if child_refs:
+        for ref in child_refs:
+            tasks.append({
+                "name": ref.get("pipelineTaskName", ref.get("name", "")),
+                "taskrun_name": ref.get("name", ""),
+            })
+        return tasks
+
+    # Fall back to inline taskRuns (v1beta1 format)
+    task_runs = plr.get("status", {}).get("taskRuns", {})
+    for task_run_name, task_run_status in task_runs.items():
+        task_status = task_run_status.get("status", {})
+        conds = task_status.get("conditions", [])
+        result = conds[-1].get("reason", "Unknown") if conds else "Unknown"
+
+        start = task_status.get("startTime")
+        end = task_status.get("completionTime")
+        duration = None
+        if start and end:
+            try:
+                from datetime import datetime
+                s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                duration = int((e - s).total_seconds())
+            except Exception:
+                pass
+
+        tasks.append({
+            "name": task_run_name,
+            "status": result,
+            "start_time": start,
+            "completion_time": end,
+            "duration_seconds": duration,
+        })
+
+    return tasks
+
+
+async def _resolve_nudge_cascade(custom_api, namespace: str, snapshot_data: Dict, releases: List[Dict], logger=None) -> List[Dict]:
+    """Find downstream build PLRs triggered by component nudge after a release."""
+    nudge_entries = []
+
+    # Find the latest release completion time as the nudge start point
+    latest_completion = None
+    for release in releases:
+        comp_time = release.get("completion_time")
+        if comp_time:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(comp_time.replace("Z", "+00:00"))
+                if latest_completion is None or dt > latest_completion:
+                    latest_completion = dt
+            except Exception:
+                pass
+
+    if not latest_completion:
+        return nudge_entries
+
+    try:
+        # List recent PLRs in the same namespace
+        plr_list = custom_api.list_namespaced_custom_object(
+            group="tekton.dev", version="v1",
+            namespace=namespace, plural="pipelineruns",
+            limit=50
+        )
+
+        for plr in plr_list.get("items", []):
+            metadata = plr.get("metadata", {})
+            annotations = metadata.get("annotations", {})
+            labels = metadata.get("labels", {})
+            created = metadata.get("creationTimestamp", "")
+
+            # Check if this PLR was created after the release and is a nudge-triggered build
+            sender = annotations.get("pipelinesascode.tekton.dev/sender", "")
+            title = annotations.get("pipelinesascode.tekton.dev/sha-title", "")
+            is_nudge = ("konflux" in sender.lower() or "red-hat-konflux" in sender.lower()) and \
+                       ("chore(deps)" in title.lower() or "update" in title.lower())
+
+            if not is_nudge:
+                continue
+
+            # Check creation time is after the release
+            try:
+                from datetime import datetime
+                created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if created_dt <= latest_completion:
+                    continue
+            except Exception:
+                continue
+
+            component = labels.get("appstudio.openshift.io/component", "")
+            status_conds = plr.get("status", {}).get("conditions", [])
+            plr_status = status_conds[0].get("reason", "Unknown") if status_conds else "Unknown"
+
+            nudge_entries.append({
+                "plr_name": metadata.get("name", ""),
+                "component": component,
+                "status": plr_status,
+                "triggered_at": created,
+                "title": title[:100],
+                "sender": sender[:40],
+            })
+
+    except Exception as e:
+        if logger:
+            logger.debug(f"Failed to resolve nudge cascade in {namespace}: {e}")
+
+    return nudge_entries
+
+
+# ============================================================================
 # ARTIFACT TRACKING AND ANALYSIS
 # ============================================================================
 
