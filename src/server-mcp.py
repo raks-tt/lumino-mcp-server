@@ -308,7 +308,7 @@ PROMETHEUS_ENDPOINTS = {
     'tekton-results-watcher': 'http://localhost:9110/metrics'
 }
 
-# OpenShift cluster Prometheus endpoints (for mcp__openshift__prometheus_query)
+# OpenShift cluster Prometheus endpoints (for mcp__lumino__prometheus_query)
 OPENSHIFT_PROMETHEUS_ENDPOINTS = {
     # Add known cluster endpoints here as fallback
     # Format: "cluster-name": {"url": "https://prometheus-endpoint-url"}
@@ -976,7 +976,7 @@ async def list_taskruns(namespace: str, pipeline_run: Optional[str] = None) -> L
 
 
 @mcp.tool()
-def list_pods_in_namespace(namespace: str) -> List[Dict[str, Any]]:
+async def list_pods_in_namespace(namespace: str) -> List[Dict[str, Any]]:
     """
     List all pods in a Kubernetes namespace with status and placement info.
 
@@ -993,13 +993,15 @@ def list_pods_in_namespace(namespace: str) -> List[Dict[str, Any]]:
     pods_info = []
     try:
         logger.info(f"Listing pods in namespace: {namespace}")
-        pod_list = k8s_core_api.list_namespaced_pod(namespace=namespace).items
+        pod_list_resp = await asyncio.to_thread(k8s_core_api.list_namespaced_pod, namespace=namespace)
+        pod_list = pod_list_resp.items
         for pod in pod_list:
             # Extract container status information for better prioritization
             total_restart_count = 0
             container_states = []
 
-            if pod.status.container_statuses:
+            # Guard against pod.status being None (pods in early creation)
+            if pod.status and pod.status.container_statuses:
                 for cs in pod.status.container_statuses:
                     if cs.restart_count:
                         total_restart_count += cs.restart_count
@@ -1011,10 +1013,21 @@ def list_pods_in_namespace(namespace: str) -> List[Dict[str, Any]]:
                         elif cs.state.terminated and cs.state.terminated.reason:
                             container_states.append(cs.state.terminated.reason)
 
+            # Check init container statuses (common failure point in Tekton)
+            if pod.status and pod.status.init_container_statuses:
+                for ics in pod.status.init_container_statuses:
+                    if ics.restart_count:
+                        total_restart_count += ics.restart_count
+                    if ics.state:
+                        if ics.state.waiting and ics.state.waiting.reason:
+                            container_states.append(f"Init:{ics.state.waiting.reason}")
+                        elif ics.state.terminated and ics.state.terminated.reason and ics.state.terminated.reason != "Completed":
+                            container_states.append(f"Init:{ics.state.terminated.reason}")
+
             pods_info.append({
                 "name": pod.metadata.name,
-                "status": pod.status.phase,
-                "ip": pod.status.pod_ip,
+                "status": pod.status.phase if pod.status else "Unknown",
+                "ip": pod.status.pod_ip if pod.status else None,
                 "node_name": pod.spec.node_name if pod.spec else "N/A",
                 "creation_timestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else "N/A",
                 "restart_count": total_restart_count,
@@ -1106,11 +1119,11 @@ def get_kubernetes_resource(
         }
 
         tekton_resources = {
-            'pipelinerun': ('pipelineruns', 'tekton.dev/v1beta1'),
-            'taskrun': ('taskruns', 'tekton.dev/v1beta1'),
-            'pipeline': ('pipelines', 'tekton.dev/v1beta1'),
-            'task': ('tasks', 'tekton.dev/v1beta1'),
-            'clustertask': ('clustertasks', 'tekton.dev/v1beta1')
+            'pipelinerun': ('pipelineruns', 'tekton.dev/v1'),
+            'taskrun': ('taskruns', 'tekton.dev/v1'),
+            'pipeline': ('pipelines', 'tekton.dev/v1'),
+            'task': ('tasks', 'tekton.dev/v1'),
+            'clustertask': ('clustertasks', 'tekton.dev/v1beta1')  # ClusterTask deprecated, stays v1beta1
         }
 
         tekton_triggers_resources = {
@@ -1449,7 +1462,7 @@ async def get_pipelinerun_logs(
                     all_logs[pod_name] = f"Error fetching logs for pod {pod_name}: {str(e)}"
 
             # Add adaptive processing metadata
-            all_logs["_adaptive_metadata"] = {
+            all_logs["_metadata"] = {
                 "adaptive_mode": True,
                 "pods_processed": processed_pods,
                 "pods_truncated": truncated_pods,
@@ -1578,13 +1591,13 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
             pod_name = pod.get("name")
             pod_status = pod.get("status")
 
-            # Check for pending pods (potential scheduling issues)
-            if pod_status == "Pending":
+            # Fetch detailed pod info once per pod that needs inspection
+            if pod_status in ["Failed", "Pending", "Running"]:
                 detailed_pod = k8s_core_api.read_namespaced_pod(
                     name=pod_name, namespace=namespace)
 
-                # Check conditions for scheduling failures
-                if detailed_pod.status.conditions:
+                # Check for pending pods (potential scheduling issues)
+                if pod_status == "Pending" and detailed_pod.status and detailed_pod.status.conditions:
                     for condition in detailed_pod.status.conditions:
                         if condition.type == "PodScheduled" and condition.status == "False":
                             pending_pods.append({
@@ -1595,21 +1608,26 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
                             })
                             break
                     else:
-                        # No specific scheduling condition found, still pending
                         pending_pods.append({
                             "pod": pod_name,
                             "issue": "Pending",
                             "reason": "Unknown",
                             "message": "Pod is pending without specific reason"
                         })
+                elif pod_status == "Pending":
+                    pending_pods.append({
+                        "pod": pod_name,
+                        "issue": "Pending",
+                        "reason": "Unknown",
+                        "message": "Pod is pending without specific reason"
+                    })
 
-            # Check for failed or problematic pods
-            if pod_status in ["Failed", "Pending", "Running"]:
-                detailed_pod = k8s_core_api.read_namespaced_pod(
-                    name=pod_name, namespace=namespace)
-
-                if hasattr(detailed_pod.status, "container_statuses") and detailed_pod.status.container_statuses:
-                    for container_status in detailed_pod.status.container_statuses:
+                # Check container statuses for issues
+                def _check_container_statuses(statuses, prefix=""):
+                    if not statuses:
+                        return
+                    for container_status in statuses:
+                        cname = f"{prefix}{container_status.name}" if prefix else container_status.name
                         # Check current state for waiting issues
                         if hasattr(container_status, "state") and container_status.state:
                             if container_status.state.waiting:
@@ -1617,7 +1635,7 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
                                 if reason in ["CrashLoopBackOff", "OOMKilled", "ImagePullBackOff", "ErrImagePull", "CreateContainerError", "CreateContainerConfigError", "ContainerCreating"]:
                                     resource_issues.append({
                                         "pod": pod_name,
-                                        "container": container_status.name,
+                                        "container": cname,
                                         "issue": reason,
                                         "message": container_status.state.waiting.message or ""
                                     })
@@ -1628,7 +1646,7 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
                                 if container_status.last_state.terminated.reason == "OOMKilled":
                                     oom_killed_pods.append({
                                         "pod": pod_name,
-                                        "container": container_status.name,
+                                        "container": cname,
                                         "issue": "OOMKilled",
                                         "restart_count": container_status.restart_count,
                                         "message": f"Container was OOMKilled and restarted {container_status.restart_count} times"
@@ -1638,11 +1656,15 @@ async def check_resource_constraints(namespace: str) -> Dict[str, Any]:
                         if container_status.restart_count and container_status.restart_count > 5:
                             resource_issues.append({
                                 "pod": pod_name,
-                                "container": container_status.name,
+                                "container": cname,
                                 "issue": "HighRestartCount",
                                 "restart_count": container_status.restart_count,
                                 "message": f"Container has restarted {container_status.restart_count} times"
                             })
+
+                if detailed_pod.status:
+                    _check_container_statuses(detailed_pod.status.container_statuses)
+                    _check_container_statuses(detailed_pod.status.init_container_statuses, prefix="init:")
 
         # Format resource quotas
         quota_data = []
@@ -1849,8 +1871,8 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
                     "reason": f"Unusually long duration (z-score: {anomaly.get('z_score', 0):.2f})",
                     "actual_value": anomaly.get("value"),
                     "expected_range": (
-                        max(0, stats["mean"] - 2 * stats["std_dev"]),
-                        stats["mean"] + 2 * stats["std_dev"]
+                        max(0, stats["mean"] - 2.5 * stats["std_dev"]),
+                        stats["mean"] + 2.5 * stats["std_dev"]
                     )
                 })
 
@@ -1865,8 +1887,8 @@ async def detect_anomalies(namespace: str, limit: int = 50) -> Dict[str, List[Di
                     "reason": f"Unusually long duration (z-score: {anomaly.get('z_score', 0):.2f})",
                     "actual_value": anomaly.get("value"),
                     "expected_range": (
-                        max(0, stats["mean"] - 2 * stats["std_dev"]),
-                        stats["mean"] + 2 * stats["std_dev"]
+                        max(0, stats["mean"] - 2.5 * stats["std_dev"]),
+                        stats["mean"] + 2.5 * stats["std_dev"]
                     )
                 })
 
@@ -2169,9 +2191,7 @@ async def smart_get_namespace_events(
     strategy: str = "auto",
     focus_areas: Optional[List[str]] = None,
     max_context_tokens: int = 8000,
-    include_summary: bool = True,
-    severity_filter: Optional[List[str]] = None,
-    resource_filter: Optional[str] = None
+    include_summary: bool = True
 ) -> Dict[str, Any]:
     """
     Adaptive event analysis for a namespace with automatic volume management.
@@ -2187,8 +2207,6 @@ async def smart_get_namespace_events(
         focus_areas: Areas to emphasize (default: ["errors", "warnings", "failures"]).
         max_context_tokens: Max output tokens (default: 8000).
         include_summary: Include summary and insights (default: True).
-        severity_filter: Filter by severity levels.
-        resource_filter: Filter by resource type.
 
     Returns:
         Dict: Events with adaptive filtering, insights, and recommendations.
@@ -2627,15 +2645,24 @@ async def analyze_logs(log_text: str) -> Dict[str, Any]:
     Returns:
         Dict[str, Any]: Keys: error_count, error_patterns, categorized_errors, summary.
     """
-    error_patterns = extract_error_patterns(log_text)
-    error_categories = categorize_errors(log_text, error_patterns)
+    try:
+        error_patterns = extract_error_patterns(log_text)
+        error_categories = categorize_errors(log_text, error_patterns)
 
-    return {
-        "error_count": len(error_patterns),
-        "error_patterns": error_patterns,
-        "categorized_errors": error_categories,
-        "summary": generate_log_summary(log_text, error_patterns, error_categories)
-    }
+        return {
+            "error_count": len(error_patterns),
+            "error_patterns": error_patterns,
+            "categorized_errors": error_categories,
+            "summary": generate_log_summary(log_text, error_patterns, error_categories)
+        }
+    except Exception as e:
+        logger.error(f"Error in analyze_logs: {e}", exc_info=True)
+        return {
+            "error_count": 0,
+            "error_patterns": [],
+            "categorized_errors": {},
+            "summary": f"Analysis failed: {str(e)}"
+        }
 
 
 @mcp.tool()
@@ -3086,7 +3113,7 @@ async def find_pipeline(
         pattern_lower = pipeline_id_pattern.lower()
 
         # Use ThreadPoolExecutor for parallel API calls
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=3)
 
         def fetch_pipelineruns_namespaced(ns: str):
@@ -3218,7 +3245,7 @@ async def find_pipeline(
                     break  # Stop processing once max_results reached
                 status = pr.get("status", {})
                 conditions = status.get("conditions", [{}])
-                condition = conditions[0] if conditions else {}
+                condition = conditions[-1] if conditions else {}
 
                 results["pipeline_runs"].append({
                     "namespace": namespace,
@@ -3254,7 +3281,7 @@ async def find_pipeline(
                         break  # Stop processing once max_results reached
                     status = tr.get("status", {})
                     conditions = status.get("conditions", [{}])
-                    condition = conditions[0] if conditions else {}
+                    condition = conditions[-1] if conditions else {}
 
                     results["task_runs"].append({
                         "namespace": namespace,
@@ -3880,7 +3907,6 @@ async def search_resources_by_labels(
     resource_types: List[str],
     label_selectors: List[Dict[str, Any]],
     namespaces: Optional[List[str]] = None,
-    field_selectors: Optional[List[str]] = None,
     limit_per_type: int = 100,
     include_metadata_only: bool = False,
     include_status: bool = True,
@@ -3894,7 +3920,6 @@ async def search_resources_by_labels(
         resource_types: Types to search (e.g., ["pods", "services", "deployments"]).
         label_selectors: Criteria list [{"key": str, "value": str, "operator": "equals|exists|not_equals|in|not_in"}].
         namespaces: Namespaces to search (default: all).
-        field_selectors: Additional field selectors.
         limit_per_type: Max results per type (default: 100).
         include_metadata_only: Return only metadata (default: False).
         include_status: Include status info (default: True).
@@ -5249,7 +5274,7 @@ async def prometheus_query(
         Dict: Query results, metadata, execution info, and analysis.
     """
     start_execution_time = time.time()
-    tool_name = "mcp__openshift__prometheus_query"
+    tool_name = "mcp__lumino__prometheus_query"
 
     logger.info(f"[{tool_name}] Starting Prometheus query execution")
     logger.info(f"[{tool_name}] Query: {query}")
@@ -6265,7 +6290,6 @@ async def smart_summarize_pod_logs(
 
 @mcp.tool()
 async def investigate_tls_certificate_issues(
-    search_pattern: str = "tls: bad certificate",
     time_range: str = "24h",
     max_namespaces: int = 20,
     focus_on_system_namespaces: bool = True
@@ -6276,7 +6300,6 @@ async def investigate_tls_certificate_issues(
     Searches system namespaces for TLS error patterns and correlates with certificate events.
 
     Args:
-        search_pattern: TLS error pattern (default: "tls: bad certificate").
         time_range: Search time range (default: "24h").
         max_namespaces: Max namespaces to search (default: 20).
         focus_on_system_namespaces: Prioritize system namespaces (default: True).
@@ -7764,6 +7787,12 @@ async def advanced_event_analytics(
     """
 
     tool_name = "advanced_event_analytics"
+
+    # Validate analysis_depth
+    valid_depths = {"basic", "comprehensive", "deep"}
+    if analysis_depth not in valid_depths:
+        return {"error": f"Invalid analysis_depth '{analysis_depth}'. Must be one of: {', '.join(sorted(valid_depths))}"}
+
     logger.info(f"[{tool_name}] Starting advanced analytics for namespace '{namespace}'")
 
     try:
@@ -7777,26 +7806,19 @@ async def advanced_event_analytics(
         if "error" in base_result:
             return {"error": f"Failed to get base event data: {base_result['error']}"}
 
-        # Extract events for advanced processing
+        # Extract events from progressive analysis results (avoid duplicate API calls)
         events_data = []
-        if "overview" in base_result and "detailed_analysis" in base_result:
-            # Reconstruct events from progressive analysis results
-            smart_result = await smart_get_namespace_events(
-                namespace=namespace,
-                time_period=time_period,
-                strategy="smart_summary",
-                include_summary=False
-            )
-
-            if "events" in smart_result:
-                for event in smart_result["events"]:
-                    events_data.append({
-                        "event_string": event.get("event_string", ""),
-                        "severity": event.get("severity"),
-                        "category": event.get("category"),
-                        "timestamp": datetime.fromisoformat(event.get("timestamp", datetime.now().isoformat())),
-                        "relevance_score": event.get("relevance_score", 0)
-                    })
+        if "overview" in base_result:
+            # Use events already fetched by progressive_event_analysis
+            overview_events = base_result.get("overview", {}).get("events", [])
+            for event in overview_events:
+                events_data.append({
+                    "event_string": event.get("event_string", ""),
+                    "severity": event.get("severity"),
+                    "category": event.get("category"),
+                    "timestamp": datetime.fromisoformat(event.get("timestamp", datetime.now().isoformat())),
+                    "relevance_score": event.get("relevance_score", 0)
+                })
 
         if not events_data:
             # Fallback: even without events, try log and metrics correlation if enabled
@@ -7943,6 +7965,11 @@ async def automated_triage_rca_report_generator(
     Returns:
         Dict: RCA report with summary, timeline, root cause, diagnostics, and remediation.
     """
+    # Validate investigation_depth
+    valid_depths = {"quick", "standard", "deep"}
+    if investigation_depth not in valid_depths:
+        return {"error": f"Invalid investigation_depth '{investigation_depth}'. Must be one of: {', '.join(sorted(valid_depths))}"}
+
     try:
         logger.info(f"Starting automated RCA for failure: {failure_identifier}")
         investigation_start = datetime.now().isoformat()
@@ -8113,7 +8140,6 @@ async def check_cluster_certificate_health(
     warning_threshold_days: int = 30,
     critical_threshold_days: int = 7,
     include_system_certs: bool = True,
-    include_user_certs: bool = True,
     namespaces: Optional[List[str]] = None,
     certificate_types: Optional[List[str]] = None
 ) -> Dict[str, Any]:
@@ -8126,7 +8152,6 @@ async def check_cluster_certificate_health(
         warning_threshold_days: Days before expiration for warning (default: 30).
         critical_threshold_days: Days before expiration for critical alert (default: 7).
         include_system_certs: Include system certificates (default: True).
-        include_user_certs: Include user certificates (default: True).
         namespaces: Namespaces to scan (default: all accessible).
         certificate_types: Types to check: "tls", "ca", "client", "server" (default: all).
 
@@ -8489,22 +8514,17 @@ async def ci_cd_performance_baselining_tool(
     pipeline_names: Optional[List[str]] = None,
     baseline_period: str = "30d",
     deviation_threshold: float = 2.0,
-    performance_metrics: Optional[List[str]] = None,
-    update_frequency: str = "daily",
     include_task_level: bool = True
 ) -> Dict[str, Any]:
     """
     Establish performance baselines for pipelines and flag runs deviating from historical norms.
 
     Uses Prometheus metrics from Tekton controller for accurate historical performance data.
-    Falls back to Kubernetes API if Prometheus is unavailable.
 
     Args:
         pipeline_names: Pipelines to analyze (default: all).
         baseline_period: "7d", "30d" (default), or "90d".
         deviation_threshold: Std deviations to trigger alerts (default: 2.0).
-        performance_metrics: Metrics: "duration", "cpu", "memory", "success_rate" (default: all).
-        update_frequency: "daily" (default) or "weekly".
         include_task_level: Include task-level analysis (default: True).
 
     Returns:
@@ -8516,7 +8536,6 @@ async def ci_cd_performance_baselining_tool(
         # Initialize result structure
         result = {
             "pipeline_baselines": [],
-            "recent_runs_analysis": [],
             "performance_trends": {
                 "improving_pipelines": [],
                 "degrading_pipelines": [],
@@ -9025,7 +9044,6 @@ async def ci_cd_performance_baselining_tool(
         logger.error(f"Error in CI/CD performance baselining: {str(e)}", exc_info=True)
         return {
             "pipeline_baselines": [],
-            "recent_runs_analysis": [],
             "performance_trends": {
                 "improving_pipelines": [],
                 "degrading_pipelines": [],
@@ -9254,7 +9272,6 @@ async def pipeline_tracer(
 async def get_machine_config_pool_status(
     pool_names: Optional[List[str]] = None,
     include_node_details: bool = True,
-    show_config_diff: bool = False,
     include_update_history: bool = True,
     filter_updating: bool = False
 ) -> Dict[str, Any]:
@@ -9266,7 +9283,6 @@ async def get_machine_config_pool_status(
     Args:
         pool_names: Pools to monitor (default: all).
         include_node_details: Include node status per pool (default: True).
-        show_config_diff: Show config differences during updates (default: False).
         include_update_history: Include update history (default: True).
         filter_updating: Only show updating pools (default: False).
 
@@ -9803,14 +9819,14 @@ async def get_openshift_cluster_operator_status(
                 "degraded": False
             }
 
-            # Analyze conditions
+            # Analyze conditions - always parse for health assessment, only include raw in output if requested
             conditions = status.get("conditions", [])
+            conditions_analysis = analyze_operator_conditions(conditions)
+            operator_analysis["available"] = conditions_analysis["available"]
+            operator_analysis["progressing"] = conditions_analysis["progressing"]
+            operator_analysis["degraded"] = conditions_analysis["degraded"]
             if include_conditions:
-                conditions_analysis = analyze_operator_conditions(conditions)
                 operator_analysis["conditions_analysis"] = conditions_analysis
-                operator_analysis["available"] = conditions_analysis["available"]
-                operator_analysis["progressing"] = conditions_analysis["progressing"]
-                operator_analysis["degraded"] = conditions_analysis["degraded"]
                 operator_analysis["conditions"] = conditions
 
             # Calculate overall status
@@ -9842,15 +9858,15 @@ async def get_openshift_cluster_operator_status(
 
             analyzed_operators.append(operator_analysis)
 
-        # Filter degraded operators if requested
-        if filter_degraded:
-            analyzed_operators = [op for op in analyzed_operators if op.get("degraded", False) or op.get("status") != "available"]
-            logger.info(f"Filtered to {len(analyzed_operators)} operators with issues")
-
-        # Calculate health summary
+        # Calculate health summary from ALL operators before filtering
         total_operators = len(analyzed_operators)
         healthy_operators = len([op for op in analyzed_operators if op.get("status") == "available"])
         degraded_operators = len([op for op in analyzed_operators if op.get("degraded", False)])
+
+        # Filter degraded operators if requested (after counting)
+        if filter_degraded:
+            analyzed_operators = [op for op in analyzed_operators if op.get("degraded", False) or op.get("status") != "available"]
+            logger.info(f"Filtered to {len(analyzed_operators)} operators with issues")
 
         overall_health = "healthy"
         if degraded_operators > 0:
@@ -10727,9 +10743,6 @@ async def predictive_log_analyzer(
     prediction_window: str = "6h",
     confidence_threshold: float = 0.75,
     log_sources: Optional[List[str]] = None,
-    failure_types: Optional[List[str]] = None,
-    historical_data_range: str = "30d",
-    model_refresh_interval: str = "24h",
     namespaces: Optional[List[str]] = None,
     max_namespaces: int = 20,
     force_retrain: bool = False
@@ -10744,9 +10757,6 @@ async def predictive_log_analyzer(
         prediction_window: Time window - "1h", "6h", "24h", "7d" (default: "6h").
         confidence_threshold: Min confidence for predictions 0.0-1.0 (default: 0.75).
         log_sources: Sources to analyze - pods, services, nodes (default: all).
-        failure_types: Types to predict - pod_crash, resource_exhaustion, network_issues.
-        historical_data_range: Historical data period (default: "30d").
-        model_refresh_interval: Model retrain frequency (default: "24h").
         namespaces: Specific namespaces to analyze (default: auto-detect active namespaces).
         max_namespaces: Maximum namespaces to scan when auto-detecting (default: 20).
         force_retrain: Force model retraining even if cached model is valid (default: False).
@@ -10860,16 +10870,17 @@ async def predictive_log_analyzer(
                 logger.warning(f"Failed to collect logs from {source}: {str(e)}")
                 continue
 
-        # Add some sample log patterns if no logs collected
+        # Return early if no logs collected - never fabricate analysis from fake data
         if not all_logs:
-            logger.warning("No logs collected, using sample patterns for analysis")
-            all_logs = [
-                "2024-01-15T10:30:00Z INFO Application started successfully",
-                "2024-01-15T10:31:00Z WARN Connection timeout to database",
-                "2024-01-15T10:32:00Z ERROR Failed to process request: timeout",
-                "2024-01-15T10:33:00Z ERROR Out of memory exception in worker",
-                "2024-01-15T10:34:00Z FATAL Service unavailable"
-            ]
+            logger.warning("No logs collected from any source - returning insufficient data")
+            result["trend_analysis"]["error_rate_trend"] = "no_data"
+            result["model_performance"] = {
+                "accuracy": None,
+                "precision": None,
+                "recall": None,
+                "note": "No log data available for analysis"
+            }
+            return result
 
         # Filter out empty lines
         all_logs = [log for log in all_logs if log.strip()]
@@ -10986,33 +10997,41 @@ async def predictive_log_analyzer(
         anomaly_predictions = anomaly_model.predict(features)
 
         # Update model performance if not already set by persistence
+        # Note: without labeled validation data, precision/recall cannot be computed
         if result["model_performance"]["accuracy"] == 0.0:
             normal_predictions = anomaly_predictions == 1
             accuracy = np.mean(normal_predictions) if len(normal_predictions) > 0 else 0.0
             result["model_performance"].update({
                 "accuracy": float(accuracy),
-                "precision": float(max(0.7, accuracy - 0.1)),
-                "recall": float(max(0.6, accuracy - 0.2))
+                "precision": None,
+                "recall": None,
+                "note": "Precision/recall require labeled validation data - not available"
             })
 
-        # Generate anomaly scores per component — use actual namespace names
+        # Generate aggregate anomaly scores per namespace
+        # anomaly_scores are per-log-line, so aggregate by namespace using mean score
         if target_namespaces:
-            components = target_namespaces[:min(4, len(anomaly_scores))]
-        else:
-            components = [f"component_{i}" for i in range(min(4, len(anomaly_scores)))]
+            # Calculate per-namespace aggregated scores from per-line scores
+            lines_per_ns = max(1, len(anomaly_scores) // max(1, len(target_namespaces)))
+            threshold = -0.5  # Typical anomaly threshold for Isolation Forest
 
-        for i, component in enumerate(components):
-            if i < len(anomaly_scores):
-                score = float(anomaly_scores[i])
-                threshold = -0.5  # Typical anomaly threshold for Isolation Forest
-                status = "anomalous" if score < threshold else "normal"
+            for i, ns in enumerate(target_namespaces[:min(10, len(target_namespaces))]):
+                start_idx = i * lines_per_ns
+                end_idx = min(start_idx + lines_per_ns, len(anomaly_scores))
+                if start_idx < len(anomaly_scores):
+                    ns_scores = anomaly_scores[start_idx:end_idx]
+                    mean_score = float(np.mean(ns_scores))
+                    anomalous_lines = int(np.sum(ns_scores < threshold))
+                    status = "anomalous" if mean_score < threshold else "normal"
 
-                result["anomaly_scores"].append({
-                    "component": component,
-                    "score": score,
-                    "threshold": threshold,
-                    "status": status
-                })
+                    result["anomaly_scores"].append({
+                        "component": ns,
+                        "score": mean_score,
+                        "threshold": threshold,
+                        "status": status,
+                        "anomalous_log_lines": anomalous_lines,
+                        "total_log_lines": len(ns_scores)
+                    })
 
         # Analyze patterns for failure prediction - pass historical failures for correlation
         historical_failures_for_analysis = []
@@ -11692,11 +11711,8 @@ async def _analyze_cluster_capacity_new(core_api, log) -> Dict[str, Any]:
 async def resource_bottleneck_forecaster(
     forecast_horizon: str = "24h",
     resource_types: Optional[List[str]] = None,
-    clusters: Optional[List[str]] = None,
     namespaces: Optional[List[str]] = None,
-    confidence_level: float = 0.95,
-    trend_analysis_period: str = "7d",
-    alerting_threshold: float = 0.80
+    trend_analysis_period: str = "7d"
 ) -> Dict[str, Any]:
     """
     Forecast resource bottlenecks by analyzing utilization trends and predicting exhaustion points.
@@ -11706,24 +11722,14 @@ async def resource_bottleneck_forecaster(
     Args:
         forecast_horizon: Forecast window - "1h", "6h", "24h", "7d", "30d" (default: "24h").
         resource_types: Resources to analyze - cpu, memory, disk, network, pvc (default: all).
-        clusters: Specific clusters to analyze (default: all).
         namespaces: Specific namespaces to focus on.
-        confidence_level: Statistical confidence 0.80-0.99 (default: 0.95).
         trend_analysis_period: Historical period for trends (default: "7d").
-        alerting_threshold: Alert threshold percentage (default: 0.80).
 
     Returns:
         Dict: Keys: forecasts, capacity_recommendations, cluster_overview, historical_accuracy.
     """
     try:
         logger.info(f"Starting resource bottleneck forecasting for horizon: {forecast_horizon}")
-
-        # Validate parameters
-        if confidence_level < 0.80 or confidence_level > 0.99:
-            confidence_level = 0.95
-
-        if alerting_threshold < 0.1 or alerting_threshold > 1.0:
-            alerting_threshold = 0.80
 
         # Default resource types if not specified
         if resource_types is None:
@@ -11928,11 +11934,12 @@ async def resource_bottleneck_forecaster(
         # Analyze cluster overview
         cluster_overview = await _analyze_cluster_capacity_new(k8s_core_api, logger)
 
-        # Historical accuracy (simplified for demo)
+        # Historical accuracy - not tracked (requires prediction validation pipeline)
         historical_accuracy = {
             "previous_predictions": len(forecasts),
-            "accuracy_rate": 0.85,  # Mock accuracy
-            "last_validation": datetime.now().isoformat()
+            "accuracy_rate": None,
+            "last_validation": None,
+            "note": "Prediction validation not implemented - accuracy not tracked"
         }
 
         result = {
