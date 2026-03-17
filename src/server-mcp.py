@@ -6309,7 +6309,7 @@ async def investigate_tls_certificate_issues(
     """
     try:
         tool_name = "investigate_tls_certificate_issues"
-        logger.info(f"[{tool_name}] Starting TLS certificate issue investigation for pattern: '{search_pattern}'")
+        logger.info(f"[{tool_name}] Starting TLS certificate issue investigation")
 
         # Get namespaces to search, prioritizing system namespaces
         all_namespaces = await list_namespaces()
@@ -6343,7 +6343,7 @@ async def investigate_tls_certificate_issues(
         for namespace in target_namespaces:
             try:
                 # Get pods in namespace
-                pods_info = list_pods_in_namespace(namespace)
+                pods_info = await list_pods_in_namespace(namespace)
 
                 if not isinstance(pods_info, list) or not pods_info:
                     continue
@@ -6437,7 +6437,6 @@ async def investigate_tls_certificate_issues(
         total_certificate_events = len(certificate_problems)
 
         analysis_summary = {
-            "search_pattern": search_pattern,
             "time_range": time_range,
             "namespaces_searched": len(target_namespaces),
             "total_tls_issues": total_issues,
@@ -6482,7 +6481,6 @@ async def investigate_tls_certificate_issues(
         logger.error(f"[{tool_name}] Error in TLS investigation: {str(e)}", exc_info=True)
         return {
             "error": f"TLS investigation failed: {str(e)}",
-            "search_pattern": search_pattern,
             "suggestion": "Try using direct pod log analysis for specific pods with TLS issues"
         }
 
@@ -6521,7 +6519,7 @@ async def conservative_namespace_overview(
         tokens_per_pod = max_total_tokens // max_pods
 
         # Get all pods
-        pods_info = list_pods_in_namespace(namespace)
+        pods_info = await list_pods_in_namespace(namespace)
         if isinstance(pods_info, list) and pods_info and "error" in pods_info[0]:
             return {"error": f"Failed to discover pods: {pods_info[0]['error']}"}
 
@@ -6713,7 +6711,7 @@ async def adaptive_namespace_investigation(
         logger.info(f"[{tool_name}] Phase 1: Discovery (budget: {discovery_budget:,} tokens)")
 
         # Get all pods in namespace
-        pods_info = list_pods_in_namespace(namespace)
+        pods_info = await list_pods_in_namespace(namespace)
         if isinstance(pods_info, list) and pods_info and "error" in pods_info[0]:
             return {"error": f"Failed to discover pods: {pods_info[0]['error']}"}
 
@@ -12040,7 +12038,7 @@ async def semantic_log_search(
                 namespace_results = []
 
                 # Get pods in namespace
-                pods_info = list_pods_in_namespace(namespace)
+                pods_info = await list_pods_in_namespace(namespace)
 
                 # Search pod logs with correct arguments
                 for pod_info in pods_info[:5]:  # Limit to 5 pods per namespace for performance
