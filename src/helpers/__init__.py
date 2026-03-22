@@ -54,6 +54,7 @@ from .constants import (
     LOG_ANALYSIS_CONFIG,
     PIPELINE_ANALYSIS_CONFIG,
     SEMANTIC_SEARCH_CONFIG,
+    KUBEARCHIVE_CONFIG,
 )
 
 from .semantic_search import (
@@ -238,6 +239,14 @@ from .ml_persistence import (
     # Helper functions
     build_labels_from_correlations,
     parse_time_period as parse_ml_time_period,
+)
+
+from .kubearchive_integration import (
+    KubeArchiveEndpointDiscovery,
+    KubeArchiveClient,
+    check_kubearchive_availability,
+    query_kubearchive_resources,
+    format_timestamp_for_kubearchive
 )
 
 __all__ = [
@@ -426,4 +435,11 @@ __all__ = [
     "ModelVersionManager",
     "build_labels_from_correlations",
     "parse_ml_time_period",
+
+    # Kubearchive Integration
+    "KubeArchiveEndpointDiscovery",
+    "KubeArchiveClient",
+    "check_kubearchive_availability",
+    "query_kubearchive_resources",
+    "format_timestamp_for_kubearchive"
 ]

@@ -181,6 +181,7 @@ from helpers import (
     generate_simulation_recommendations,
     # Simulation affected components
     identify_affected_components,
+    KUBEARCHIVE_CONFIG
 )
 
 # Configure logging with custom format
@@ -201,6 +202,51 @@ mcp = FastMCP(name="lumino-mcp-server", stateless_http=False)
 
 # Health check functionality will be handled by the MCP server itself
 # The FastMCP framework provides its own health endpoints
+
+# Import new KubeArchive classes
+from helpers.kubearchive_integration import (
+    KubeArchiveEndpointDiscovery,
+    KubeArchiveClient,
+    check_kubearchive_availability,
+    format_timestamp_for_kubearchive,
+    query_kubearchive_resources
+)
+
+# Configure Kubernetes client
+try:
+    config.load_incluster_config()
+    # logger.info("Loaded Kubernetes configuration from cluster")
+except config.ConfigException:
+    config.load_kube_config()
+    logger.info("Loaded Kubernetes configuration from local kubeconfig")
+
+k8s_core_api = client.CoreV1Api()
+k8s_apps_api = client.AppsV1Api()
+k8s_custom_api = client.CustomObjectsApi()
+k8s_storage_api = client.StorageV1Api()
+k8s_batch_api = client.BatchV1Api()
+
+# Initialize NetworkingV1Api for Ingress support (for KubeArchive discovery on plain Kubernetes)
+try:
+    k8s_networking_api = client.NetworkingV1Api()
+except Exception as e:
+    logger.warning(f"Failed to initialize NetworkingV1Api: {e}")
+    k8s_networking_api = None
+
+# Initialize KubeArchive endpoint discovery and client
+kubearchive_endpoint_discovery = KubeArchiveEndpointDiscovery(
+    k8s_core_api=k8s_core_api,
+    k8s_custom_api=k8s_custom_api,
+    k8s_networking_api=k8s_networking_api,
+    auto_port_forward=True  # Enable automatic port-forwarding for local development
+)
+
+# Global KubeArchive client instance (cached to avoid re-discovery)
+ka_client = None
+
+# KubeArchive host discovery cache (Issue #8)
+_kubearchive_host_cache: Dict[str, Any] = {"host": None, "ts": 0}
+KUBEARCHIVE_CACHE_TTL_SEC = 300
 
 
 # Create a decorator to add tool execution logging
@@ -12316,4 +12362,426 @@ async def what_if_scenario_simulator(
             "simulation_id": simulation_id if 'simulation_id' in locals() else "unknown",
             "error": f"Simulation failed: {str(e)}",
             "timestamp": datetime.now().isoformat()
+        }
+
+async def setup_kubearchive_client() -> KubeArchiveClient:
+    global ka_client
+    if ka_client is None:
+        logger.info(f"KubeArchive client is not initialized, setting up...")
+
+        # Discover KubeArchive endpoint using auto-discovery
+        logger.info(f"Discovering KubeArchive API endpoint...")
+        ka_endpoint = await kubearchive_endpoint_discovery.discover_endpoint()
+
+        if not ka_endpoint:
+            return None
+
+        logger.info(f"Using KubeArchive endpoint: {ka_endpoint}")
+
+        # Initialize KubeArchive client with discovered endpoint
+        ka_client = KubeArchiveClient(
+            endpoint_discovery=kubearchive_endpoint_discovery,
+            k8s_core_api=k8s_core_api
+        )
+    else:
+        logger.info(f"Reusing cached KubeArchive client")
+
+    return ka_client
+
+# NEW TOOL: KUBEARCHIVE QUERIES
+@mcp.tool()
+@log_tool_execution
+async def query_kubearchive(
+    resource_type: str,
+    namespace: str,
+    name: Optional[str] = None,
+    label_selector: Optional[str] = None,
+    field_selector: Optional[str] = None,
+    since_time: Optional[str] = None,
+    until_time: Optional[str] = None,
+    include_logs: bool = False,
+    correlate_live: bool = False,
+    limit: int = 100,
+    output_format: str = "summary"
+) -> Dict[str, Any]:
+    """
+    Query archived Kubernetes resources from KubeArchive (Issue #8).
+    
+    KubeArchive stores historical resources that have been cleaned up from
+    the cluster, enabling long-term analysis of PipelineRuns, TaskRuns, Pods,
+    and their logs. Auto-detects KubeArchive availability when KUBEARCHIVE_HOST
+    is not set.
+    
+    Use cases:
+    - Investigate failed builds from the past (e.g. last week)
+    - Get logs from an archived resource (use query_kubearchive_logs tool instead for easier log retrieval)
+    - Full history merged with live resources (correlate_live=True)
+
+    Note: For dedicated log retrieval, use the query_kubearchive_logs tool which is
+    optimized for fetching logs and has a simpler interface.
+    
+    Args:
+        resource_type: Type of resource: "pipelinerun", "taskrun", "pod", "release", "snapshot"
+        namespace: Kubernetes namespace to query (required)
+        name: Optional specific resource name
+        label_selector: Optional label selector (e.g. "tekton.dev/pipeline=my-pipeline")
+        field_selector: Optional field selector
+        since_time: Only return resources created after this time (RFC3339)
+        until_time: Only return resources created before this time (RFC3339)
+        include_logs: Set to True to fetch logs for pods, taskruns, and pipelineruns (default: False)
+        correlate_live: Merge archived results with live cluster resources; prefer live, add source field
+        limit: Maximum number of resources to return (default 100)
+        output_format: "summary", "detailed", or "yaml"
+    
+    Returns:
+        Dict with keys: resources, total_count, time_range, kubearchive_status,
+        and correlation_summary (when correlate_live=True).
+    """
+    tool_name = "query_kubearchive"
+    start_time = time.time()
+    logger.info(f"[{tool_name}] resource_type={resource_type}, namespace={namespace}, include_logs={include_logs}, correlate_live={correlate_live}")
+
+    try:
+        # Normalize timestamps if provided
+        if since_time:
+            since_time = format_timestamp_for_kubearchive(since_time)
+        if until_time:
+            until_time = format_timestamp_for_kubearchive(until_time)
+
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        ka_client = await setup_kubearchive_client()
+        if ka_client is None:
+            return {
+                "resources": [],
+                "total_count": 0,
+                "time_range": {"since": since_time, "until": until_time},
+                "kubearchive_status": "unavailable",
+                "error": "KubeArchive not configured or not available. Set KUBEARCHIVE_HOST or install KubeArchive.",
+                "suggestions": [
+                    "Deploy KubeArchive to your cluster (https://github.com/kubearchive/kubearchive)",
+                    "Or set KUBEARCHIVE_HOST environment variable to your KubeArchive API endpoint",
+                    "Example: export KUBEARCHIVE_HOST='https://kubearchive-api-server.kubearchive.svc.cluster.local:8081'",
+                    "For OpenShift: KubeArchive Route will be auto-discovered",
+                    "For Kubernetes: KubeArchive Ingress will be auto-discovered",
+                    "Or set KUBEARCHIVE_ENABLED=false to disable"
+                ],
+                "execution_time_ms": execution_time,
+            }
+
+        ka_endpoint = ka_client.endpoint_discovery.get_cached_endpoint()
+
+        # Query resources from KubeArchive
+        result = await query_kubearchive_resources(
+            kubearchive_client=ka_client,
+            resource_type=resource_type,
+            namespace=namespace,
+            name=name,
+            label_selector=label_selector,
+            field_selector=field_selector,
+            since_time=since_time,
+            until_time=until_time,
+            include_logs=include_logs,
+            limit=limit,
+            output_format=output_format,
+        )
+
+        # Log if logs were included
+        if include_logs:
+            resources_with_logs = 0
+            for r in result.get("resources", []):
+                if isinstance(r, dict) and ('logs' in r or 'logs_error' in r):
+                    resources_with_logs += 1
+                elif isinstance(r, str) and '# Logs:' in r:
+                    resources_with_logs += 1
+            logger.info(f"[{tool_name}] Fetched logs for {resources_with_logs}/{result.get('total_count', 0)} resources")
+
+        if result.get("kubearchive_status") == "error":
+            execution_time = round((time.time() - start_time) * 1000, 2)
+            result["execution_time_ms"] = execution_time
+            return result
+        
+        if correlate_live and resource_type in ("pipelinerun", "taskrun", "pod"):
+            # Fetch live resources and merge (prefer live, add source)
+            live_list: List[Dict[str, Any]] = []
+            try:
+                if resource_type == "pipelinerun":
+                    resp = k8s_custom_api.list_namespaced_custom_object(
+                        group="tekton.dev", version="v1", namespace=namespace,
+                        plural="pipelineruns",
+                        label_selector=label_selector or "",
+                        field_selector=field_selector or "",
+                        limit=limit,
+                    )
+                    live_list = resp.get("items", [])
+                elif resource_type == "taskrun":
+                    resp = k8s_custom_api.list_namespaced_custom_object(
+                        group="tekton.dev", version="v1", namespace=namespace,
+                        plural="taskruns",
+                        label_selector=label_selector or "",
+                        field_selector=field_selector or "",
+                        limit=limit,
+                    )
+                    live_list = resp.get("items", [])
+                elif resource_type == "pod":
+                    pods = k8s_core_api.list_namespaced_pod(
+                        namespace=namespace,
+                        label_selector=label_selector or "",
+                        field_selector=field_selector or "",
+                        limit=limit,
+                    ).items
+                    live_list = [p.to_dict() if hasattr(p, "to_dict") else p for p in pods]
+            except ApiException as e:
+                logger.warning(f"[{tool_name}] Live list failed: {e}")
+
+            # Convert live items to same payload shape and add source
+            # Preserve logs from archived resources
+            archived_by_key: Dict[tuple, Dict[str, Any]] = {}
+            for r in result.get("resources", []):
+                if isinstance(r, dict):
+                    key = (r.get("namespace"), r.get("name"))
+                    if key not in archived_by_key:
+                        archived_resource = dict(r)
+                        archived_resource["source"] = "archived"
+                        archived_by_key[key] = archived_resource
+
+            # Helper function to format live resources
+            def _format_live_resource(item: Dict[str, Any]) -> Dict[str, Any]:
+                """Format live resource to match archived resource format."""
+                meta = item.get("metadata", {})
+                status = item.get("status", {})
+
+                if output_format == "summary":
+                    # Extract phase based on resource type
+                    phase = "Unknown"
+                    if resource_type in ("pipelinerun", "taskrun"):
+                        conditions = status.get("conditions", [])
+                        if conditions:
+                            for cond in conditions:
+                                if cond.get("type") == "Succeeded":
+                                    if cond.get("status") == "True":
+                                        phase = "Succeeded"
+                                    elif cond.get("status") == "False":
+                                        phase = "Failed"
+                                    else:
+                                        phase = "Running"
+                                    break
+                    elif resource_type == "pod":
+                        phase = status.get("phase", "Unknown")
+
+                    return {
+                        "type": resource_type,
+                        "name": meta.get("name"),
+                        "namespace": meta.get("namespace", namespace),
+                        "creation_timestamp": meta.get("creationTimestamp"),
+                        "phase": phase,
+                        "source": "live"
+                    }
+                elif output_format == "detailed":
+                    return {
+                        "type": resource_type,
+                        "name": meta.get("name"),
+                        "namespace": meta.get("namespace", namespace),
+                        "creation_timestamp": meta.get("creationTimestamp"),
+                        "metadata": meta,
+                        "status": status,
+                        "spec": item.get("spec", {}),
+                        "labels": meta.get("labels", {}),
+                        "annotations": meta.get("annotations", {}),
+                        "source": "live"
+                    }
+                else:  # yaml
+                    import yaml
+                    item_copy = dict(item)
+                    return yaml.dump(item_copy, default_flow_style=False) + "\n# Source: live\n"
+
+            for item in live_list:
+                meta = item.get("metadata", {})
+                rname = meta.get("name")
+                rns = meta.get("namespace", namespace)
+                key = (rns, rname)
+                payload = _format_live_resource(item)
+
+                # Prefer live resources but preserve logs from archived resources
+                if key in archived_by_key and include_logs:
+                    # Keep logs from archived resource if they exist
+                    archived_resource = archived_by_key[key]
+                    if isinstance(archived_resource, dict) and 'logs' in archived_resource:
+                        if isinstance(payload, dict):
+                            payload['logs'] = archived_resource['logs']
+                            if 'logs_message' in archived_resource:
+                                payload['logs_message'] = archived_resource['logs_message']
+                            if 'logs_error' in archived_resource:
+                                payload['logs_error'] = archived_resource['logs_error']
+                        elif isinstance(payload, str) and isinstance(archived_resource.get('logs'), str):
+                            # YAML format - append logs
+                            payload += f"\n# Logs (from archive):\n{archived_resource['logs']}"
+
+                archived_by_key[key] = payload
+
+            merged = list(archived_by_key.values())
+            result["resources"] = merged
+            result["total_count"] = len(merged)
+            live_count = sum(1 for m in merged if (isinstance(m, dict) and m.get("source") == "live") or (isinstance(m, str) and "Source: live" in m))
+
+            # Log if logs were preserved after merging
+            if include_logs:
+                resources_with_logs_after = 0
+                for r in merged:
+                    if isinstance(r, dict) and ('logs' in r or 'logs_error' in r):
+                        resources_with_logs_after += 1
+                    elif isinstance(r, str) and '# Logs' in r:
+                        resources_with_logs_after += 1
+                logger.info(f"[{tool_name}] After correlation: {resources_with_logs_after}/{len(merged)} resources have logs")
+
+            result["correlation_summary"] = {
+                "live_count": live_count,
+                "archived_count": len(merged) - live_count,
+                "total": len(merged),
+            }
+        
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        result["execution_time_ms"] = execution_time
+        result["kubearchive_endpoint"] = ka_endpoint
+        return result
+        
+    except Exception as e:
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        logger.exception(f"[{tool_name}] {e}")
+        return {
+            "resources": [],
+            "total_count": 0,
+            "time_range": {"since": since_time, "until": until_time},
+            "kubearchive_status": "error",
+            "error": str(e),
+            "execution_time_ms": execution_time,
+        }
+
+# NEW TOOL: KUBEARCHIVE LOG QUERIES
+@mcp.tool()
+@log_tool_execution
+async def query_kubearchive_logs(
+    resource_type: str,
+    namespace: str,
+    name: str,
+    container: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Retrieve logs for archived Kubernetes resources from KubeArchive.
+
+    This tool specifically fetches logs from archived resources that have been
+    cleaned up from the cluster. The KubeArchive API traverses owner references
+    to gather all logs associated with the given resource.
+
+    Common use cases:
+    - Get logs from an archived PipelineRun to investigate past failures
+    - Retrieve TaskRun logs after the task has been deleted
+    - Access Pod logs that are no longer available in the cluster
+
+    Supported resources:
+    - PipelineRuns: Returns logs from all TaskRuns and their pods
+    - TaskRuns: Returns logs from all pods created by the TaskRun
+    - Pods: Returns direct container logs
+
+    Args:
+        resource_type: Type of resource: "pipelinerun", "taskrun", or "pod"
+        namespace: Kubernetes namespace (required)
+        name: Resource name (required, exact match)
+        container: Optional container name for multi-container pods
+
+    Returns:
+        Dict with keys:
+        - status: 'success' or 'error'
+        - logs: Log text (if successful)
+        - message: Error or informational message
+        - resource: Resource details (type, namespace, name)
+        - kubearchive_endpoint: Endpoint used
+        - execution_time_ms: Time taken in milliseconds
+
+    Example:
+        # Get logs from an archived PipelineRun
+        result = query_kubearchive_logs(
+            resource_type="pipelinerun",
+            namespace="my-namespace",
+            name="my-pipeline-run-xyz"
+        )
+    """
+    tool_name = "query_kubearchive_logs"
+    start_time = time.time()
+    logger.info(f"[{tool_name}] resource_type={resource_type}, namespace={namespace}, name={name}")
+
+    try:
+        # Validate resource type
+        valid_types = ["pipelinerun", "taskrun", "pod"]
+        if resource_type.lower() not in valid_types:
+            return {
+                "status": "error",
+                "message": f"Invalid resource_type '{resource_type}'. Must be one of: {', '.join(valid_types)}",
+                "resource": {"type": resource_type, "namespace": namespace, "name": name},
+                "execution_time_ms": round((time.time() - start_time) * 1000, 2)
+            }
+
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        ka_client = await setup_kubearchive_client()
+        if ka_client is None:
+            return {
+                "resources": [],
+                "total_count": 0,
+                "time_range": {"since": since_time, "until": until_time},
+                "kubearchive_status": "unavailable",
+                "error": "KubeArchive not configured or not available. Set KUBEARCHIVE_HOST or install KubeArchive.",
+                "suggestions": [
+                    "Deploy KubeArchive to your cluster (https://github.com/kubearchive/kubearchive)",
+                    "Or set KUBEARCHIVE_HOST environment variable to your KubeArchive API endpoint",
+                    "Example: export KUBEARCHIVE_HOST='https://kubearchive-api-server.kubearchive.svc.cluster.local:8081'",
+                    "For OpenShift: KubeArchive Route will be auto-discovered",
+                    "For Kubernetes: KubeArchive Ingress will be auto-discovered",
+                    "Or set KUBEARCHIVE_ENABLED=false to disable"
+                ],
+                "execution_time_ms": execution_time,
+            }
+        
+        ka_endpoint = ka_client.endpoint_discovery.get_cached_endpoint()
+
+        # Retrieve logs
+        logger.debug(f"[{tool_name}] Fetching logs for {resource_type}/{name} in namespace {namespace}")
+        logs_result = await ka_client.get_resource_logs(
+            resource_type=resource_type,
+            namespace=namespace,
+            name=name,
+            container=container
+        )
+
+        # Add additional metadata
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        logs_result["resource"] = {
+            "type": resource_type,
+            "namespace": namespace,
+            "name": name
+        }
+        if container:
+            logs_result["resource"]["container"] = container
+
+        logs_result["execution_time_ms"] = execution_time
+        result["kubearchive_endpoint"] = ka_endpoint
+
+        # Log summary
+        if logs_result.get("status") == "success":
+            log_length = len(logs_result.get("logs", "")) / 1.3
+            if log_length > 0:
+                logger.info(f"[{tool_name}] Successfully retrieved {log_length} tokens of logs")
+            else:
+                logger.info(f"[{tool_name}] No logs found for {resource_type}/{name}")
+        else:
+            logger.warning(f"[{tool_name}] Failed to retrieve logs: {logs_result.get('message')}")
+
+        return logs_result
+
+    except Exception as e:
+        execution_time = round((time.time() - start_time) * 1000, 2)
+        logger.exception(f"[{tool_name}] {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "resource": {"type": resource_type, "namespace": namespace, "name": name},
+            "execution_time_ms": execution_time,
         }

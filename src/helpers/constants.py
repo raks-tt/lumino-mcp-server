@@ -173,3 +173,33 @@ SEMANTIC_SEARCH_CONFIG = {
         "task", "tasks", "taskrun", "taskruns", "trigger", "triggers"
     ]
 }
+
+# ============================================================================
+# KUBEARCHIVE CONFIGURATION
+# ============================================================================
+
+KUBEARCHIVE_CONFIG = {
+    "endpoints": {
+        "default": {
+            "url": None,  # Must be set via environment variable: KUBEARCHIVE_URL
+            "description": "Default Kubearchive endpoint"
+        }
+    },
+    "authentication": {
+        # Token MUST be set via environment variable: KUBEARCHIVE_TOKEN
+        "token": None
+    },
+    "defaults": {
+        "fetch_logs": True,
+        "max_results_per_type": 100,
+        "timeout": 30,
+        "include_pipelineruns": True,
+        "include_taskruns": True
+    },
+    "api_structure": {
+        # Expected API paths - may need adjustment based on actual Kubearchive deployment
+        "list_resources": "/api/v1/{kind}",
+        "get_resource": "/api/v1/namespaces/{namespace}/{kind}/{name}",
+        "get_logs": "/api/v1/namespaces/{namespace}/{kind}/{name}/log"
+    }
+}
