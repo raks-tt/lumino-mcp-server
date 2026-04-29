@@ -602,11 +602,12 @@ class KubeArchiveClient:
         """
         Get Kubernetes bearer token for authentication.
 
-        Returns token from:
+        Returns token from (in priority order):
         1. Provided token (from constructor)
         2. In-cluster service account token (/var/run/secrets/kubernetes.io/serviceaccount/token)
-        3. OpenShift oc CLI token (oc whoami -t) - for OpenShift clusters only
-        4. Local kubeconfig token (extracted via kubernetes.config)
+        3. Existing k8s client token (from the API client initialized at server startup — guarantees
+           the token matches the cluster the MCP server is connected to)
+        4. OpenShift oc CLI token (oc whoami -t) - for OpenShift clusters only
         5. Auto-created token for local development (kubectl create token) - Kubernetes only, not OpenShift
         """
         if self._auth_token:
@@ -623,52 +624,22 @@ class KubeArchiveClient:
             except Exception as e:
                 logger.debug(f"Error reading in-cluster token: {e}")
 
+        # Extract token from the existing k8s client that was initialized at server startup.
+        # This is the safest source: it guarantees the token matches the cluster the server
+        # is actually connected to, even if the user switches kubeconfig contexts later.
+        token = self._extract_token_from_client()
+        if token:
+            return token
+
         # For OpenShift clusters, try to get token from oc CLI (user's current session)
         if self._is_openshift_cluster():
             logger.info("Detected OpenShift cluster, attempting to use oc login token")
             oc_token = await self._get_openshift_token()
             if oc_token:
-                logger.info("✓ Using token from oc login session (no service account needed)")
+                logger.info("Using token from oc login session")
                 return oc_token
             else:
                 logger.warning("Could not get token from oc CLI. Please ensure you're logged in: oc login")
-
-        # Try to get token from kubeconfig
-        try:
-            from kubernetes import config as k8s_config
-
-            # Load the current configuration
-            contexts, active_context = k8s_config.list_kube_config_contexts()
-            if not contexts:
-                logger.warning("No kubernetes contexts found in kubeconfig")
-                return None
-
-            # Get the configuration for the active context
-            api_client = k8s_config.new_client_from_config()
-
-            # Extract the token from the API client configuration
-            if hasattr(api_client.configuration, 'api_key'):
-                api_key = api_client.configuration.api_key.get('authorization')
-                if api_key:
-                    # The api_key might be in format "Bearer <token>"
-                    if api_key.startswith('Bearer '):
-                        logger.debug("Using token from kubeconfig api_key")
-                        return api_key[7:]  # Remove "Bearer " prefix
-                    logger.debug("Using token from kubeconfig")
-                    return api_key
-
-            # Try alternative: get token from configuration
-            if hasattr(api_client.configuration, 'api_key_prefix'):
-                # Some configurations store the token differently
-                auth_token = api_client.configuration.api_key.get('BearerToken')
-                if auth_token:
-                    logger.debug("Using BearerToken from kubeconfig")
-                    return auth_token
-
-            logger.debug("No bearer token found in kubeconfig")
-
-        except Exception as e:
-            logger.debug(f"Error extracting token from kubeconfig: {e}")
 
         # Only create service account for non-OpenShift Kubernetes clusters
         if not self._is_openshift_cluster():
@@ -680,6 +651,27 @@ class KubeArchiveClient:
             logger.warning("OpenShift cluster detected but no token available. Please run: oc login")
 
         logger.warning("Could not auto-detect or create auth token. Set explicitly or ensure kubeconfig is available")
+        return None
+
+    def _extract_token_from_client(self) -> Optional[str]:
+        """Extract bearer token from the existing Kubernetes API client."""
+        if not self.k8s_core_api:
+            return None
+        try:
+            config = self.k8s_core_api.api_client.configuration
+            api_key = config.api_key.get('authorization')
+            if api_key:
+                if api_key.startswith('Bearer '):
+                    logger.info("Using token from existing Kubernetes client")
+                    return api_key[7:]
+                return api_key
+
+            bearer = config.api_key.get('BearerToken')
+            if bearer:
+                logger.info("Using BearerToken from existing Kubernetes client")
+                return bearer
+        except Exception as e:
+            logger.debug(f"Could not extract token from existing client: {e}")
         return None
 
     def _is_openshift_cluster(self) -> bool:
