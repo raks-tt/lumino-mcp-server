@@ -246,7 +246,8 @@ from .kubearchive_integration import (
     KubeArchiveClient,
     check_kubearchive_availability,
     query_kubearchive_resources,
-    format_timestamp_for_kubearchive
+    format_timestamp_for_kubearchive,
+    setup_kubearchive_client
 )
 
 __all__ = [
@@ -436,10 +437,10 @@ __all__ = [
     "build_labels_from_correlations",
     "parse_ml_time_period",
 
-    # Kubearchive Integration
     "KubeArchiveEndpointDiscovery",
     "KubeArchiveClient",
     "check_kubearchive_availability",
     "query_kubearchive_resources",
-    "format_timestamp_for_kubearchive"
+    "format_timestamp_for_kubearchive",
+    "setup_kubearchive_client"
 ]
