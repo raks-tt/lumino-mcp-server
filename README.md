@@ -412,7 +412,7 @@ The server automatically detects Kubernetes configuration:
 
 ## Available Tools
 
-### Kubernetes Core (4 tools)
+### Kubernetes Core (5 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -420,6 +420,7 @@ The server automatically detects Kubernetes configuration:
 | `list_pods_in_namespace` | List pods with status and placement info |
 | `get_kubernetes_resource` | Get any Kubernetes resource with flexible output |
 | `search_resources_by_labels` | Search resources across namespaces by labels |
+| `query_kubearchive` | Query archived Kubernetes resources from KubeArchive with optional log retrieval |
 
 ### Tekton Pipelines (6 tools)
 
@@ -442,6 +443,7 @@ The server automatically detects Kubernetes configuration:
 | `analyze_pod_logs_hybrid` | Combined analysis strategies |
 | `detect_log_anomalies` | Anomaly detection with severity levels |
 | `semantic_log_search` | NLP-based semantic log search |
+
 
 ### Event Analysis (3 tools)
 

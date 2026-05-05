@@ -202,6 +202,50 @@ mcp = FastMCP(name="lumino-mcp-server", stateless_http=False)
 # Health check functionality will be handled by the MCP server itself
 # The FastMCP framework provides its own health endpoints
 
+from helpers.kubearchive_integration import (
+    KubeArchiveEndpointDiscovery,
+    KubeArchiveClient,
+    check_kubearchive_availability,
+    query_kubearchive_resources,
+    normalize_to_rfc3339,
+    setup_kubearchive_client
+)
+
+# Configure Kubernetes client
+try:
+    config.load_incluster_config()
+    # logger.info("Loaded Kubernetes configuration from cluster")
+except config.ConfigException:
+    config.load_kube_config()
+    logger.info("Loaded Kubernetes configuration from local kubeconfig")
+
+k8s_core_api = client.CoreV1Api()
+k8s_apps_api = client.AppsV1Api()
+k8s_custom_api = client.CustomObjectsApi()
+k8s_storage_api = client.StorageV1Api()
+k8s_batch_api = client.BatchV1Api()
+
+# Initialize NetworkingV1Api for Ingress support (for KubeArchive discovery on plain Kubernetes)
+try:
+    k8s_networking_api = client.NetworkingV1Api()
+except Exception as e:
+    logger.warning(f"Failed to initialize NetworkingV1Api: {e}")
+    k8s_networking_api = None
+
+if k8s_core_api is not None and k8s_custom_api is not None:
+    kubearchive_endpoint_discovery = KubeArchiveEndpointDiscovery(
+        k8s_core_api=k8s_core_api,
+        k8s_custom_api=k8s_custom_api,
+        k8s_networking_api=k8s_networking_api,
+        auto_port_forward=True,
+    )
+else:
+    kubearchive_endpoint_discovery = None
+
+# KubeArchive host discovery cache (Issue #8)
+_kubearchive_host_cache: Dict[str, Any] = {"host": None, "ts": 0}
+KUBEARCHIVE_CACHE_TTL_SEC = 300
+
 
 # Create a decorator to add tool execution logging
 def log_tool_execution(func):
@@ -12317,3 +12361,200 @@ async def what_if_scenario_simulator(
             "error": f"Simulation failed: {str(e)}",
             "timestamp": datetime.now().isoformat()
         }
+
+@mcp.tool()
+async def query_kubearchive(
+    resource_type: str,
+    namespace: str,
+    name: Optional[str] = None,
+    label_selector: Optional[str] = None,
+    field_selector: Optional[str] = None,
+    since_time: Optional[str] = None,
+    until_time: Optional[str] = None,
+    include_logs: bool = False,
+    container: Optional[str] = None,
+    limit: int = 100,
+    output_format: str = "summary",
+) -> Dict[str, Any]:
+    """
+    Query archived Kubernetes resources from KubeArchive (historical data no longer on the cluster).
+
+    Single entry point for archived resources and their logs: set include_logs=True to attach logs
+    for pipelinerun, taskrun, and pod results (use an exact name when you only need one resource).
+    Optional container selects a container for multi-container pods.
+
+    Args:
+        resource_type: One of pipelinerun, taskrun, pod, release, snapshot (case-insensitive).
+        namespace: Kubernetes namespace to search.
+        name: Optional resource name; wildcards supported (e.g. my-pipeline-*).
+        label_selector: Kubernetes label selector string.
+        field_selector: Kubernetes field selector string (KubeArchive support may vary).
+        since_time: Lower bound for creation time (RFC3339 or ISO date).
+        until_time: Upper bound for creation time (RFC3339 or ISO date).
+        include_logs: If True, fetch logs for each matching pod, taskrun, or pipelinerun.
+        container: Optional container name (pods; passed to KubeArchive when include_logs=True).
+        limit: Max resources to return (1-1000; out-of-range values are clamped).
+        output_format: summary, detailed, or yaml.
+
+    Returns:
+        Dict with kubearchive_status, kubearchive_endpoint, resources, total_count, time_range,
+        filters_applied, message, and error when applicable.
+    """
+    ka_logger = logging.getLogger("lumino-mcp.query_kubearchive")
+    valid_types = ["pipelinerun", "taskrun", "pod", "release", "snapshot"]
+    valid_formats = ["summary", "detailed", "yaml"]
+    filters_applied = {
+        "resource_type": resource_type,
+        "namespace": namespace,
+        "name": name,
+        "label_selector": label_selector,
+        "field_selector": field_selector,
+        "container": container,
+    }
+
+    def _base_response(
+        status: str,
+        resources: Optional[List[Any]] = None,
+        total: int = 0,
+        endpoint: Optional[str] = None,
+        error: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "kubearchive_status": status,
+            "resources": resources if resources is not None else [],
+            "total_count": total,
+            "time_range": {"since": since_time, "until": until_time},
+            "filters_applied": filters_applied,
+        }
+        if endpoint is not None:
+            out["kubearchive_endpoint"] = endpoint
+        if message:
+            out["message"] = message
+        if error:
+            out["error"] = error
+        return out
+
+    ka_logger.info(
+        "query_kubearchive resource_type=%s namespace=%s include_logs=%s container=%s limit=%s output_format=%s",
+        resource_type,
+        namespace,
+        include_logs,
+        container,
+        limit,
+        output_format,
+    )
+
+    try:
+        if resource_type.lower() not in valid_types:
+            return _base_response(
+                "error",
+                error=f"Invalid resource_type '{resource_type}'. Must be one of: {', '.join(valid_types)}",
+                message="Validation failed",
+            )
+
+        if output_format not in valid_formats:
+            return _base_response(
+                "error",
+                error=f"Invalid output_format '{output_format}'. Must be one of: {', '.join(valid_formats)}",
+                message="Validation failed",
+            )
+
+        orig_limit = limit
+        if limit < 1 or limit > 1000:
+            limit = min(max(1, limit), 1000)
+            ka_logger.warning("limit adjusted from %s to %s (valid range 1-1000)", orig_limit, limit)
+
+        if since_time:
+            try:
+                since_time = normalize_to_rfc3339(since_time.strip())
+            except ValueError as e:
+                return _base_response(
+                    "error",
+                    error=f"Invalid since_time: {e}. Use RFC3339 or ISO date, e.g. 2024-01-15T10:30:00Z or 2024-01-15",
+                    message="Validation failed",
+                )
+
+        if until_time:
+            try:
+                until_time = normalize_to_rfc3339(until_time.strip())
+            except ValueError as e:
+                return _base_response(
+                    "error",
+                    error=f"Invalid until_time: {e}. Use RFC3339 or ISO date, e.g. 2024-01-15T10:30:00Z or 2024-01-15",
+                    message="Validation failed",
+                )
+
+        if kubearchive_endpoint_discovery is None:
+            return _base_response(
+                "error",
+                error="Kubernetes API clients are not initialized. Load kubeconfig or run in-cluster.",
+                message="KubeArchive discovery requires CoreV1Api and CustomObjectsApi",
+            )
+
+        availability = await check_kubearchive_availability(kubearchive_endpoint_discovery)
+        ka_endpoint = availability.get("endpoint")
+        if not availability.get("available"):
+            msg = availability.get("message", "KubeArchive not available")
+            ka_logger.warning("KubeArchive availability check failed: %s", msg)
+            sug = [
+                "Deploy KubeArchive (https://github.com/kubearchive/kubearchive)",
+                "Set KUBEARCHIVE_HOST to your KubeArchive API base URL",
+                "Example: export KUBEARCHIVE_HOST='https://kubearchive-api-server.kubearchive.svc.cluster.local:8081'",
+            ]
+            out = _base_response(
+                "error",
+                error=msg,
+                message="KubeArchive unavailable",
+            )
+            if ka_endpoint:
+                out["kubearchive_endpoint"] = ka_endpoint
+            out["suggestions"] = sug
+            return out
+
+        ka_client = await setup_kubearchive_client(
+            endpoint_discovery=kubearchive_endpoint_discovery,
+            k8s_core_api=k8s_core_api,
+        )
+
+        result = await query_kubearchive_resources(
+            kubearchive_client=ka_client,
+            resource_type=resource_type,
+            namespace=namespace,
+            name=name,
+            label_selector=label_selector,
+            field_selector=field_selector,
+            since_time=since_time,
+            until_time=until_time,
+            include_logs=include_logs,
+            container=container,
+            limit=limit,
+            output_format=output_format,
+        )
+
+        result["filters_applied"] = filters_applied
+        result["kubearchive_endpoint"] = ka_endpoint
+
+        if result.get("kubearchive_status") == "success":
+            n = result.get("total_count", 0)
+            result["message"] = (
+                f"Found {n} archived resource(s)" if n else "No archived resources found matching criteria"
+            )
+        else:
+            if "message" not in result:
+                result["message"] = result.get("error", "KubeArchive query failed")
+
+        ka_logger.info("query_kubearchive completed status=%s count=%s", result.get("kubearchive_status"), result.get("total_count"))
+        return result
+
+    except Exception as e:
+        ka_logger.error("query_kubearchive failed: %s", e, exc_info=True)
+        out = _base_response("error", error=str(e), message="Unexpected error")
+        if kubearchive_endpoint_discovery is not None:
+            try:
+                ep = await kubearchive_endpoint_discovery.discover_endpoint()
+                if ep:
+                    out["kubearchive_endpoint"] = ep
+            except Exception:
+                pass
+        return out
